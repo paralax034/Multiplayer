@@ -250,10 +250,13 @@ namespace Multiplayer.Client.Patches
             }
         }
 
-        [SyncMethod(exposeParameters = [1], context = SyncContext.QueueOrder_Down)]
+        [SyncMethod(exposeParameters = [1], context = SyncContext.QueueOrder_Down, cancelIfAnyArgNull = true)]
         static bool CustomTryTakeOrderedJob(Pawn_JobTracker self, Job job, JobTag? tag = JobTag.Misc,
             bool requestQueueing = false)
         {
+            if (self?.pawn == null || !self.pawn.Spawned)
+                return false;
+
             if (self.TryTakeOrderedJob(job, tag, requestQueueing) && (TickPatch.currentExecutingCmdIssuedBySelf || Multiplayer.Client == null))
                 FleckMaker.Static(job.targetA.Cell, self.pawn.Map, FleckDefOf.FeedbackGoto);
             return false;

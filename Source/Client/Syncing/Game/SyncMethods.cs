@@ -673,7 +673,7 @@ namespace Multiplayer.Client
         public static int stylingStationJobStartedByMe = -1;
 
         [MpPrefix(typeof(Pawn_JobTracker), nameof(Pawn_JobTracker.TryTakeOrderedJob))]
-        static void TryTakeOrderedJob_Prefix(Job job)
+        static void TryTakeOrderedJob_Prefix(Pawn_JobTracker __instance, Job job)
         {
             // If Pawn_JobTracker.TryTakeOrderedJob is synced directly, JobMaker.MakeJob for its job is called in interface code (outside of a synced method)
             // UniqueIDs assigned in the interface are always negative and specific to a client
@@ -681,6 +681,10 @@ namespace Multiplayer.Client
 
             if (Multiplayer.ExecutingCmds && job.loadID < 0)
             {
+                // If the pawn is already despawned (e.g. formed a caravan or left the map), do not consume a synchronized Job ID
+                if (__instance?.pawn == null || !__instance.pawn.Spawned)
+                    return;
+
                 job.loadID = Find.UniqueIDsManager.GetNextJobID();
 
                 if (!TickPatch.currentExecutingCmdIssuedBySelf)

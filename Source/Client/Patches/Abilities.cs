@@ -1,5 +1,7 @@
-﻿using HarmonyLib;
+﻿using System;
+using HarmonyLib;
 using RimWorld;
+using RimWorld.Planet;
 using Verse;
 
 namespace Multiplayer.Client
@@ -26,6 +28,34 @@ namespace Multiplayer.Client
         {
             if (__state)
                 Multiplayer.dontSync = false;
+        }
+    }
+
+    [HarmonyPatch(typeof(Ability), nameof(Ability.ShowCastingConfirmationIfNeeded), typeof(LocalTargetInfo), typeof(Action))]
+    static class BypassAbilityConfirmationDuringExecution_Local
+    {
+        static bool Prefix(Action cast)
+        {
+            if (Multiplayer.ExecutingCmds)
+            {
+                cast?.Invoke();
+                return false;
+            }
+            return true;
+        }
+    }
+
+    [HarmonyPatch(typeof(Ability), nameof(Ability.ShowCastingConfirmationIfNeeded), typeof(GlobalTargetInfo), typeof(Action))]
+    static class BypassAbilityConfirmationDuringExecution_Global
+    {
+        static bool Prefix(Action cast)
+        {
+            if (Multiplayer.ExecutingCmds)
+            {
+                cast?.Invoke();
+                return false;
+            }
+            return true;
         }
     }
 }

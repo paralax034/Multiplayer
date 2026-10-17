@@ -750,5 +750,11 @@ namespace Multiplayer.Client.Patches
             Multiplayer.Client != null ? length : UnityData.GetIdealBatchCount(length);
     }
 
+    [HarmonyPatch(typeof(PowerNet), nameof(PowerNet.DistributeEnergyAmongBatteries))]
+    static class PowerNetBatteryDistributionDeterminismPatch
+    {
+        static void Prefix() => Rand.PushState();
+        static void Postfix() => Rand.PopState();
+    }
 
 }

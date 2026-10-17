@@ -137,6 +137,10 @@ namespace Multiplayer.Client.Patches
                         g.loadID = Find.UniqueIDsManager.GetNextGeneID();
                     else if (obj is Hediff { loadID: < 0 } h)
                         h.loadID = Find.UniqueIDsManager.GetNextHediffID();
+                    else if (obj is Ideo { id: < 0 } ideo)
+                        ideo.id = Find.UniqueIDsManager.GetNextIdeoID();
+                    else if (obj is Precept { ID: < 0 } precept)
+                        precept.ID = Find.UniqueIDsManager.GetNextPreceptID();
                 }
             }
         }
@@ -156,6 +160,23 @@ namespace Multiplayer.Client.Patches
 
                 yield return inst;
             }
+        }
+    }
+
+    [HarmonyPatch(typeof(WorkGiver_Scanner), nameof(WorkGiver_Scanner.HasJobOnThing))]
+    static class WorkGiverScanner_HasJobOnThing_IdGuard
+    {
+        static void Prefix(ref bool __state)
+        {
+            if (Multiplayer.Client == null) return;
+            __state = UniqueIdsPatch.useLocalIdsOverride;
+            UniqueIdsPatch.useLocalIdsOverride = true;
+        }
+
+        static void Postfix(bool __state)
+        {
+            if (Multiplayer.Client == null) return;
+            UniqueIdsPatch.useLocalIdsOverride = __state;
         }
     }
 

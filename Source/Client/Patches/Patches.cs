@@ -52,7 +52,7 @@ namespace Multiplayer.Client
     }
 
     [HarmonyPatch(typeof(Dialog_BillConfig), MethodType.Constructor)]
-    [HarmonyPatch(new[] {typeof(Bill_Production), typeof(IntVec3)})]
+    [HarmonyPatch(new[] { typeof(Bill_Production), typeof(IntVec3) })]
     public static class DialogPatch
     {
         static void Postfix(Dialog_BillConfig __instance)
@@ -406,10 +406,12 @@ namespace Multiplayer.Client
         {
             if (Multiplayer.Client == null) return true;
 
-            foreach(var part in Find.QuestManager.QuestsListForReading.SelectMany(q => q.parts).OfType<QuestPart_Choice>()) {
+            foreach (var part in Find.QuestManager.QuestsListForReading.SelectMany(q => q.parts).OfType<QuestPart_Choice>())
+            {
                 int index = part.choices.IndexOf(___localChoice);
 
-                if (index >= 0) {
+                if (index >= 0)
+                {
                     Choose(part, index);
                     return false;
                 }
@@ -424,6 +426,37 @@ namespace Multiplayer.Client
         internal static void Choose(QuestPart_Choice part, int index)
         {
             part.Choose(part.choices[index]);
+        }
+
+        [HarmonyPatch(typeof(MainTabWindow_Quests), nameof(MainTabWindow_Quests.DoAcceptButton))]
+        static class DevAcceptInstantlySyncPatch
+        {
+            static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+            {
+                var targetAccept = AccessTools.Method(typeof(Quest), nameof(Quest.Accept));
+                var replacement = AccessTools.Method(typeof(DevAcceptInstantlySyncPatch), nameof(DevAcceptOverride));
+
+                foreach (var ci in instructions)
+                {
+                    if (ci.Calls(targetAccept))
+                    {
+                        ci.opcode = OpCodes.Call;
+                        ci.operand = replacement;
+                    }
+                    yield return ci;
+                }
+            }
+
+            static void DevAcceptOverride(Quest quest, Pawn originalPawn)
+            {
+                if (Multiplayer.Client == null)
+                {
+                    quest.Accept(originalPawn);
+                    return;
+                }
+
+                DevQuestAcceptUtility.SyncedDevAccept(quest);
+            }
         }
     }
 

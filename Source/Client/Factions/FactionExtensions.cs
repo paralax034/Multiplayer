@@ -1,4 +1,3 @@
-using System.Linq;
 using RimWorld;
 using RimWorld.Planet;
 using Verse;
@@ -40,11 +39,16 @@ public static class FactionExtensions
 
     public static bool TryGetPlayerFaction(this Quest quest, out Faction faction)
     {
-        faction = quest.QuestLookTargets
-            .Where(t => t.HasWorldObject && t.WorldObject is Settlement)
-            .Select(t => ((Settlement)t.WorldObject).Faction)
-            .FirstOrDefault(f => f != null);
+        foreach (var target in quest.QuestLookTargets)
+        {
+            if (target.HasWorldObject && target.WorldObject is Settlement settlement && settlement.Faction is { IsPlayer: true } playerFaction)
+            {
+                faction = playerFaction;
+                return true;
+            }
+        }
 
-        return faction != null;
+        faction = null;
+        return false;
     }
 }

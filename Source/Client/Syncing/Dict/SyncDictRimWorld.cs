@@ -35,6 +35,9 @@ namespace Multiplayer.Client
 
                     data.WriteUShort((ushort)defTypeIndex);
                     data.WriteUShort(def.shortHash);
+
+                    if (def.shortHash == 0)
+                        data.WriteString(def.defName ?? string.Empty);
                 },
                 (ByteReader data) => {
                     ushort defTypeIndex = data.ReadUShort();
@@ -42,8 +45,22 @@ namespace Multiplayer.Client
                         return null;
 
                     ushort shortHash = data.ReadUShort();
-
                     var defType = DefSerialization.DefTypes[defTypeIndex];
+
+                    // Maybe new InventoryStockGroupDef() is called before the def is loaded, so we need to read the defName and resolve it by name instead of shortHash
+                    if (shortHash == 0)
+                    {
+                        string defName = data.ReadString();
+                        if (string.IsNullOrEmpty(defName))
+                            return null;
+
+                        var resolvedDef = GenDefDatabase.GetDef(defType, defName, false);
+                        if (resolvedDef == null)
+                            throw new SerializationException($"Couldn't find {defType} with name '{defName}'");
+
+                        return resolvedDef;
+                    }
+
                     var def = DefSerialization.GetDef(defType, shortHash);
 
                     if (def == null)

@@ -98,15 +98,13 @@ namespace Multiplayer.Client.Comp
         static void Postfix(AsyncTimeComp __state) => __state?.PostContext();
     }
 
-    [HarmonyPatch(typeof(Quest), nameof(Quest.Accept))]
-    static class SetContextForAccept
+    [HarmonyPatch(typeof(Quest), nameof(Quest.Initiate))]
+    static class SetContextForInitiate
     {
         static void Prefix(Quest __instance, ref AsyncTimeComp __state)
         {
             if (Multiplayer.Client == null) return;
-
-            //Make sure quest is accepted and async time is enabled and there are parts to this quest
-            if (__instance.State != QuestState.NotYetAccepted || !Multiplayer.GameComp.asyncTime || __instance.parts == null) return;
+            if (!Multiplayer.GameComp.asyncTime || __instance.parts == null) return;
 
             __state = MultiplayerAsyncQuest.CacheQuest(__instance);
             __state?.PreContext();
@@ -172,7 +170,18 @@ namespace Multiplayer.Client.Comp
         /// <param name="quest">Quest to remove</param>
         /// <returns>If quest is found in cache</returns>
         public static bool TryRemoveCachedQuest(Quest quest)
-            => mapQuestsCache.SingleOrDefault(x => x.Value.Contains(quest)).Value?.Remove(quest) ?? false | worldQuestsCache.Remove(quest);
+        {
+            if (quest == null) return false;
+
+            var removedFromMap = false;
+            foreach (var kv in mapQuestsCache)
+            {
+                if (kv.Value.Remove(quest))
+                    removedFromMap = true;
+            }
+
+            return removedFromMap || worldQuestsCache.Remove(quest);
+        }
 
         /// <summary>
         /// Attempts to get the MapAsyncTimeComp cached for that quest
@@ -250,9 +259,16 @@ namespace Multiplayer.Client.Comp
         /// <param name="quests">Quests to run QuestTick() on</param>
         private static void TickQuests(IEnumerable<Quest> quests)
         {
-            foreach (var quest in quests.ToList())
+            if (quests == null) return;
+
+            var questArray = quests.ToArray();
+            for (int i = 0; i < questArray.Length; i++)
             {
-                quest.QuestTick();
+                var quest = questArray[i];
+                if (quest != null && quest.State == QuestState.Ongoing)
+                {
+                    quest.QuestTick();
+                }
             }
         }
 

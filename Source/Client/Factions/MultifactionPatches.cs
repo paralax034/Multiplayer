@@ -25,13 +25,12 @@ public static class MainTabWindow_QuestsDoRowPatch
     {
         if (Multiplayer.Client != null && !Multiplayer.settings.hideOtherPlayersQuests)
         {
-            Faction playerFaction;
-            if (quest.TryGetPlayerFaction(out playerFaction))
+            if (quest.TryGetPlayerFaction(out Faction playerFaction))
             {
                 Rect iconRect = new Rect(rect.x + 2f, rect.y + 2f, 4f, rect.height - 4f);
                 Widgets.DrawBoxSolid(iconRect, playerFaction.Color);
                 rect.xMin += 8f;
-                TooltipHandler.TipRegion(rect, "MpQuestDesc".Translate(playerFaction.Name, playerFaction == Faction.OfPlayer ? ". (you)" : "."));
+                TooltipHandler.TipRegion(rect, "MpQuestDesc".Translate(playerFaction.Name, playerFaction == Multiplayer.RealPlayerFaction ? ". (you)" : "."));
             }
             else
             {
@@ -44,18 +43,92 @@ public static class MainTabWindow_QuestsDoRowPatch
 [HarmonyPatch(typeof(MainTabWindow_Quests), nameof(MainTabWindow_Quests.ShouldListNow))]
 public static class MainTabWindow_QuestsShouldListNowPatch
 {
-    static bool Prefix(Quest quest, ref bool __result)
+    public static bool Prefix(MainTabWindow_Quests __instance, Quest quest, ref bool __result)
     {
-        if (Multiplayer.Client != null && Multiplayer.settings.hideOtherPlayersQuests)
+        if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction)
+            return true;
+
+        // In GodMode or when "DEV: Show all" checkbox is active, display everything
+        if (DebugSettings.godMode || __instance.showAll)
+            return true;
+
+        // If quest is tied to another player's faction, hide it from our quest list
+        if (quest.TryGetPlayerFaction(out Faction questFaction))
         {
-            Faction playerFaction;
-            if (quest.TryGetPlayerFaction(out playerFaction) && playerFaction != Faction.OfPlayer)
+            var myFaction = Multiplayer.RealPlayerFaction;
+            if (myFaction != null && questFaction != null && questFaction != myFaction)
             {
                 __result = false;
                 return false;
             }
         }
+
         return true;
+    }
+}
+
+[HarmonyPatch(typeof(QuestUtility), nameof(QuestUtility.CanAcceptQuest))]
+public static class QuestUtilityCanAcceptQuestPatch
+{
+    public static void Postfix(Quest quest, ref AcceptanceReport __result)
+    {
+        if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction)
+            return;
+
+        // Allow bypassing faction restriction if God Mode is enabled
+        if (DebugSettings.godMode)
+            return;
+
+        // If quest already cannot be accepted due to unmet requirements, leave it as is
+        if (!__result.Accepted)
+            return;
+
+        if (quest.TryGetPlayerFaction(out Faction questFaction))
+        {
+            var myFaction = Multiplayer.RealPlayerFaction;
+            if (myFaction != null && questFaction != null && questFaction != myFaction)
+            {
+                string reason = "MpCannotAcceptOtherPlayerQuest".CanTranslate()
+                    ? "MpCannotAcceptOtherPlayerQuest".Translate(questFaction.Name)
+                    : ("Quest belongs to " + questFaction.Name);
+
+                __result = new AcceptanceReport(reason);
+            }
+        }
+    }
+}
+
+[HarmonyPatch(typeof(MainTabWindow_Quests), nameof(MainTabWindow_Quests.DoAcceptButton))]
+public static class FixDevAcceptInstantlyPatch
+{
+    private static readonly MethodInfo AcceptMethod = AccessTools.Method(typeof(Quest), nameof(Quest.Accept));
+
+    public static bool Prefix(MainTabWindow_Quests __instance, Rect innerRect, ref float curY)
+    {
+        // We only intervene if DevMode button is about to be handled and user clicked it
+        return true;
+    }
+}
+
+public static class DevQuestAcceptUtility
+{
+    [SyncMethod]
+    public static void SyncedDevAccept(Quest quest)
+    {
+        if (quest == null || quest.State != QuestState.NotYetAccepted)
+            return;
+
+        var choicePart = quest.PartsListForReading.OfType<QuestPart_Choice>().FirstOrDefault();
+        if (choicePart != null && choicePart.choices.Any())
+        {
+            choicePart.Choose(choicePart.choices[0]);
+        }
+
+        Pawn accepter = PawnsFinder.AllMapsCaravansAndTravellingTransporters_Alive
+            .FirstOrDefault(p => p.Faction is { IsPlayer: true } && QuestUtility.CanPawnAcceptQuest(p, quest));
+
+        quest.Accept(accepter);
+        quest.dismissed = false;
     }
 }
 
@@ -125,6 +198,32 @@ public static class MainTabWindow_QuestsDoRewardsPrefsButtonPatch
 
         __result = rect;
         return false;
+    }
+}
+
+[HarmonyPatch(typeof(MainTabWindow_Quests), nameof(MainTabWindow_Quests.DoDismissButton))]
+public static class MainTabWindow_Quests_DoDismissButton_Patch
+{
+    public static bool Prefix(MainTabWindow_Quests __instance)
+    {
+        if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction)
+            return true;
+
+        if (DebugSettings.godMode)
+            return true;
+
+        var quest = __instance.selected;
+        if (quest != null && quest.TryGetPlayerFaction(out Faction questFaction))
+        {
+            var myFaction = Multiplayer.RealPlayerFaction;
+            if (myFaction != null && questFaction != null && questFaction != myFaction)
+            {
+                // Do not allow dismissing or deleting other players' quests
+                return false;
+            }
+        }
+
+        return true;
     }
 }
 
@@ -458,7 +557,13 @@ static class PawnIsColonistPatch
 
     static bool FactionIsPlayer(Faction f)
     {
-        return f == Find.FactionManager.OfPlayer;
+        if (f == null) return false;
+
+        if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction || Multiplayer.Ticking || Multiplayer.ExecutingCmds)
+            return f.IsPlayer;
+
+        Faction myFaction = Multiplayer.RealPlayerFaction ?? Find.FactionManager.OfPlayer;
+        return f == myFaction;
     }
 }
 
@@ -860,26 +965,62 @@ static class QuestPart_LendColonistsToFaction_Enable_Patch
 [HarmonyPatch(typeof(Map), nameof(Map.IsPlayerHome), MethodType.Getter)]
 static class Map_IsPlayerHome_Spectator_Patch
 {
-    static bool Prefix(Map __instance, ref bool __result)
+    public static bool Prefix(Map __instance, ref bool __result)
     {
-        if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction ||
-            Faction.OfPlayer != Multiplayer.WorldComp.spectatorFaction)
+        if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction)
             return true;
 
+        if (!__instance.wasSpawnedViaGravShipLanding)
         {
-            // Is repeat through all player faction a better idea?
-            if (!__instance.wasSpawnedViaGravShipLanding)
+            MapInfo mapInfo = __instance.info;
+            if (mapInfo?.parent == null || mapInfo.parent.Faction?.IsPlayer != true || !mapInfo.parent.def.canBePlayerHome)
             {
-                MapInfo mapInfo = __instance.info;
-                if (((mapInfo != null) ? mapInfo.parent : null) == null || __instance.info.parent.Faction?.IsPlayer != true || !__instance.info.parent.def.canBePlayerHome)
-                {
-                    __result = GravshipUtility.PlayerHasGravEngine(__instance);
-                    return false;
-                }
+                __result = GravshipUtility.PlayerHasGravEngine(__instance);
+                return false;
             }
-            __result = true;
-            return false;
         }
+
+        __result = true;
+        return false;
+    }
+}
+
+[HarmonyPatch(typeof(WorldPawns), nameof(WorldPawns.WorldPawnsTick))]
+static class IgnoreSpectatorWorldPawnsTickPatch
+{
+    private static readonly FieldInfo PawnsAliveField = AccessTools.Field(typeof(WorldPawns), "pawnsAlive");
+    private static readonly MethodInfo FilterMethod = AccessTools.Method(typeof(IgnoreSpectatorWorldPawnsTickPatch), nameof(FilterPawnsAlive));
+
+    static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+    {
+        foreach (var instr in instructions)
+        {
+            yield return instr;
+            if (instr.LoadsField(PawnsAliveField))
+            {
+                yield return new CodeInstruction(OpCodes.Call, FilterMethod);
+            }
+        }
+    }
+
+    private static readonly List<Pawn> tmpFiltered = new();
+
+    public static IEnumerable<Pawn> FilterPawnsAlive(HashSet<Pawn> pawns)
+    {
+        if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction)
+            return pawns;
+
+        var spectator = Multiplayer.WorldComp?.spectatorFaction;
+        if (spectator == null)
+            return pawns;
+
+        tmpFiltered.Clear();
+        foreach (var p in pawns)
+        {
+            if (p != null && p.Faction != spectator)
+                tmpFiltered.Add(p);
+        }
+        return tmpFiltered;
     }
 }
 
