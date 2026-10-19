@@ -13,6 +13,7 @@ using LudeonTK;
 using Multiplayer.Client.Desyncs;
 using Multiplayer.Client.Util;
 using Multiplayer.Client.Windows;
+using Multiplayer.Common;
 using RimWorld;
 using RimWorld.Planet;
 using Steamworks;
@@ -99,8 +100,8 @@ namespace Multiplayer.Client
         [DebugAction(MultiplayerCategory, "Set faction (rect)", actionType = DebugActionType.Action, allowedGameStates = AllowedGameStates.PlayingOnMap, displayPriority = 100)]
         private static void SetFaction()
         {
-        	DebugToolsGeneral.GenericRectTool("Set faction (rect)", rect =>
-        	{
+            DebugToolsGeneral.GenericRectTool("Set faction (rect)", rect =>
+            {
                 List<FloatMenuOption> factionOptions = new List<FloatMenuOption>();
                 foreach (Faction faction in Find.FactionManager.AllFactionsInViewOrder)
                 {
@@ -120,7 +121,7 @@ namespace Multiplayer.Client
                     factionOptions.Add(item);
                 }
                 Find.WindowStack.Add(new FloatMenu(factionOptions));
-        	});
+            });
         }
 
         [DebugAction(MultiplayerCategory, actionType = DebugActionType.ToolMap, allowedGameStates = AllowedGameStates.PlayingOnMap)]
@@ -226,6 +227,42 @@ namespace Multiplayer.Client
             Multiplayer.game.sync.TryAddStackTraceForDesyncLogRaw(logItem, depth, hash);
         }
 
+        [DebugAction(MultiplayerLocalCategory, name = "Simulate real desync (solo host)", allowedGameStates = AllowedGameStates.Playing)]
+        public static void SimulateRealDesyncSoloHost()
+        {
+            var syncCoordinator = Multiplayer.game.sync;
+            var localOpinion = syncCoordinator.FinishLocalOpinion();
+            if (localOpinion == null && syncCoordinator.knownClientOpinions.Count > 0)
+                localOpinion = syncCoordinator.knownClientOpinions.Last();
+
+            if (localOpinion == null || localOpinion.desyncStackTraces.Count == 0)
+            {
+                Messages.Message("No simulation traces recorded yet. Unpause the game for 2-3 seconds first.", MessageTypeDefOf.RejectInput, false);
+                return;
+            }
+
+            // Clone live opinion to simulate a remote client peer
+            var remoteOpinion = ClientSyncOpinion.Deserialize(new ByteReader(localOpinion.Serialize()));
+            remoteOpinion.isLocalClientsOpinion = false;
+
+            // Copy populated traces from local to remote so both sides have full stacktraces
+            remoteOpinion.desyncStackTraces = [.. localOpinion.desyncStackTraces];
+
+            // Inject artificial divergence at the latest step
+            if (remoteOpinion.desyncStackTraceHashes.Count > 0)
+            {
+                int lastIdx = remoteOpinion.desyncStackTraceHashes.Count - 1;
+                remoteOpinion.desyncStackTraceHashes[lastIdx] ^= 0x55555555;
+            }
+            else
+            {
+                remoteOpinion.worldRandomStates.Add(99999);
+            }
+
+            // Trigger genuine desync resolution flow
+            syncCoordinator.AddClientOpinionAndCheckDesync(remoteOpinion);
+        }
+
         [DebugAction(MultiplayerLocalCategory, name = "Show desync window", allowedGameStates = AllowedGameStates.Playing)]
         public static void ShowDesync()
         {
@@ -272,7 +309,8 @@ namespace Multiplayer.Client
             foreach (var syncWithImplType in Multiplayer.serialization.syncWithImplTypes)
                 dict[syncWithImplType.Name] = Multiplayer.serialization.TypeHelper!.GetImplementations(syncWithImplType).ToArray();
 
-            foreach(var kv in dict) {
+            foreach (var kv in dict)
+            {
                 Log.Warning($"== {kv.Key} ==");
                 Log.Message(
                     kv.Value
@@ -440,9 +478,11 @@ namespace Multiplayer.Client
         {
             var builder = new StringBuilder();
 
-            foreach (var mod in LoadedModManager.RunningModsListForReading) {
+            foreach (var mod in LoadedModManager.RunningModsListForReading)
+            {
                 builder.AppendLine("======== ").Append(mod.Name).AppendLine();
-                foreach (var asm in mod.assemblies.loadedAssemblies) {
+                foreach (var asm in mod.assemblies.loadedAssemblies)
+                {
                     builder.AppendLine(StaticFieldsToString(asm, t => !t.Namespace.StartsWith("Harmony") && !t.Namespace.StartsWith("Multiplayer")));
                 }
             }
@@ -483,7 +523,8 @@ namespace Multiplayer.Client
                 .Where(m => !(m.DeclaringType.Namespace?.StartsWith("Multiplayer") ?? false)
                     && !Harmony.GetPatchInfo(m).Transpilers.NullOrEmpty());
 
-            foreach (var method in query) {
+            foreach (var method in query)
+            {
                 builder.Append(GetMethodHash(method));
                 builder.Append(" ");
                 builder.Append(method.DeclaringType.FullName);
@@ -498,11 +539,13 @@ namespace Multiplayer.Client
         static string GetMethodHash(MethodBase method)
         {
             var toHash = new List<byte>();
-            foreach(var ins in PatchProcessor.GetOriginalInstructions(method)) {
+            foreach (var ins in PatchProcessor.GetOriginalInstructions(method))
+            {
                 toHash.Add(Encoding.UTF8.GetBytes(ins.opcode.Name + ins.operand));
             }
 
-            using (var sha256 = SHA256.Create()) {
+            using (var sha256 = SHA256.Create())
+            {
                 return Convert.ToBase64String(sha256.ComputeHash(toHash.ToArray()));
             }
         }

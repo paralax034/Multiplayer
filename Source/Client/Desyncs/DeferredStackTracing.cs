@@ -14,6 +14,8 @@ namespace Multiplayer.Client.Desyncs
     [HarmonyPatch]
     public static class DeferredStackTracing
     {
+        public const int MaxTraceDepth = 60;
+
         public static int ignoreTraces;
         public static long maxTraceDepth;
         public static int randCalls;
@@ -56,6 +58,10 @@ namespace Multiplayer.Client.Desyncs
 
             if (Rand.stateStack.Count > 1) return false;
             if (Multiplayer.IsReplay) return false;
+
+            // Skip tracing only during heavy catch-up (> MaxTraceDepth ticks behind) to maintain fast simulation.
+            // When approaching live lockstep, keep tracing enabled so forensic logs have client-side context.
+            if (TickPatch.Simulating && (TickPatch.tickUntil - TickPatch.Timer) > MaxTraceDepth) return false;
 
             if (!Multiplayer.Ticking && !Multiplayer.ExecutingCmds) return false;
 

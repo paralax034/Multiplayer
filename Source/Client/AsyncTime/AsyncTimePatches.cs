@@ -35,6 +35,30 @@ namespace Multiplayer.Client.AsyncTime
 
         static void Prefix() => updating = true;
         static void Finalizer() => updating = false;
+
+        static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+        {
+            var drawingMapProp = AccessTools.PropertyGetter(typeof(WorldRendererUtility), nameof(WorldRendererUtility.DrawingMap));
+            var replacementMethod = AccessTools.Method(typeof(MapUpdateMarker), nameof(ShouldDrawMapInUpdate));
+
+            foreach (var inst in instructions)
+            {
+                if (inst.Calls(drawingMapProp))
+                {
+                    inst.opcode = OpCodes.Call;
+                    inst.operand = replacementMethod;
+                }
+
+                yield return inst;
+            }
+        }
+
+        // Suppresses drawing of map mesh, dynamic things, flecks and overlays during catch-up simulation.
+        // Game simulation and logic update continue running normally.
+        public static bool ShouldDrawMapInUpdate()
+        {
+            return WorldRendererUtility.DrawingMap && !TickPatch.Simulating;
+        }
     }
 
     [HarmonyPatch]

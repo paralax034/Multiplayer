@@ -88,11 +88,7 @@ public static class QuestUtilityCanAcceptQuestPatch
             var myFaction = Multiplayer.RealPlayerFaction;
             if (myFaction != null && questFaction != null && questFaction != myFaction)
             {
-                string reason = "MpCannotAcceptOtherPlayerQuest".CanTranslate()
-                    ? "MpCannotAcceptOtherPlayerQuest".Translate(questFaction.Name)
-                    : ("Quest belongs to " + questFaction.Name);
-
-                __result = new AcceptanceReport(reason);
+                __result = new AcceptanceReport("MpCannotAcceptOtherPlayerQuest".Translate(questFaction.Name));
             }
         }
     }
@@ -746,43 +742,49 @@ public static class LetterSecurityUtility
         if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction) return true;
         if (lookTargets?.targets == null || lookTargets.targets.Count == 0) return true;
 
-        bool hasPlayerAffiliatedTarget = false;
+        bool hasAnyPlayerAffiliation = false;
         var targets = lookTargets.targets;
 
         for (int i = 0; i < targets.Count; i++)
         {
             var target = targets[i];
-            if (target.HasThing)
+            Faction targetFaction = null;
+
+            // Target is a Thing on a map or in a caravan
+            if (target.HasThing && target.Thing != null)
             {
                 var thing = target.Thing;
-                if (thing.Faction is { IsPlayer: true } thingFac)
-                {
-                    if (thingFac == faction) return true;
-                    hasPlayerAffiliatedTarget = true;
-                }
-                else if (thing.Map?.ParentFaction is { IsPlayer: true } mapFac)
-                {
-                    if (mapFac == faction) return true;
-                    hasPlayerAffiliatedTarget = true;
-                }
+                if (thing.Faction is { IsPlayer: true } tf)
+                    targetFaction = tf;
+                else if (thing.Map?.ParentFaction is { IsPlayer: true } mf)
+                    targetFaction = mf;
             }
-            else if (target.HasWorldObject)
+            // Target is a WorldObject (Caravan, Settlement, MapParent)
+            else if (target.HasWorldObject && target.WorldObject != null)
             {
                 var worldObj = target.WorldObject;
-                if (worldObj.Faction is { IsPlayer: true } worldFac)
-                {
-                    if (worldFac == faction) return true;
-                    hasPlayerAffiliatedTarget = true;
-                }
+                if (worldObj.Faction is { IsPlayer: true } wf)
+                    targetFaction = wf;
+                else if (worldObj is Caravan caravan && caravan.Faction is { IsPlayer: true } cf)
+                    targetFaction = cf;
             }
-            else if (target.Map?.ParentFaction is { IsPlayer: true } mapFac)
+            // Target is a cell on a player map
+            else if (target.Map?.ParentFaction is { IsPlayer: true } cellMapFac)
             {
-                if (mapFac == faction) return true;
-                hasPlayerAffiliatedTarget = true;
+                targetFaction = cellMapFac;
+            }
+
+            if (targetFaction != null)
+            {
+                hasAnyPlayerAffiliation = true;
+                if (targetFaction == faction)
+                    return true;
             }
         }
 
-        return !hasPlayerAffiliatedTarget;
+        // If the event targets another player's colony/caravan, hide it completely.
+        // If it targets an unowned wild location with no player presence, treat as public.
+        return !hasAnyPlayerAffiliation;
     }
 
     public static bool IsLetterForFaction(Letter let, Faction faction)
@@ -898,24 +900,88 @@ static class LetterStackReceiveSoundOnlyMyFaction
     }
 }
 
-[HarmonyPatch(typeof(Messages), nameof(Messages.Message), typeof(Message), typeof(bool))]
-static class MessagesMessageFilterPatch
+[HarmonyPatch(typeof(Messages), nameof(Messages.MessagesDoGUI))]
+static class MessagesDoGUIFilterPatch
 {
-    static bool Prefix(Message msg, bool historical)
-    {
-        if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction)
-            return true;
+    private static readonly FieldInfo LiveMessagesField = AccessTools.Field(typeof(Messages), "liveMessages");
+    private static readonly MethodInfo FilteredLiveMessagesMethod = AccessTools.Method(typeof(MessagesDoGUIFilterPatch), nameof(GetFilteredLiveMessages));
 
-        if (!LetterSecurityUtility.IsTargetForFaction(msg.lookTargets, Multiplayer.RealPlayerFaction))
+    static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+    {
+        foreach (var ci in instructions)
         {
-            if (historical && Find.Archive != null)
+            if (ci.LoadsField(LiveMessagesField))
             {
-                Find.Archive.Add(msg);
+                ci.opcode = OpCodes.Call;
+                ci.operand = FilteredLiveMessagesMethod;
             }
-            return false;
+            yield return ci;
+        }
+    }
+
+    private static readonly List<Message> tmpFilteredMessages = new(16);
+
+    public static List<Message> GetFilteredLiveMessages()
+    {
+        var original = Messages.liveMessages;
+        // Guard against calls from main menu / UIRoot_Entry before game session initializes
+        if (Multiplayer.Client == null || Multiplayer.game == null || !Multiplayer.GameComp.multifaction)
+            return original;
+
+        tmpFilteredMessages.Clear();
+        var myFaction = Multiplayer.RealPlayerFaction;
+
+        for (int i = 0; i < original.Count; i++)
+        {
+            var msg = original[i];
+            if (LetterSecurityUtility.IsTargetForFaction(msg.lookTargets, myFaction))
+            {
+                tmpFilteredMessages.Add(msg);
+            }
         }
 
-        return true;
+        return tmpFilteredMessages;
+    }
+}
+
+[HarmonyPatch(typeof(Messages), nameof(Messages.Message), typeof(Message), typeof(bool))]
+static class MessagesSoundFilterPatch
+{
+    private static readonly MethodInfo PlayOneShotOnCamera =
+        AccessTools.Method(typeof(SoundStarter), nameof(SoundStarter.PlayOneShotOnCamera), new[] { typeof(SoundDef), typeof(Map) });
+    private static readonly MethodInfo ReplacementMethod =
+        AccessTools.Method(typeof(MessagesSoundFilterPatch), nameof(PlayMessageSoundReplacement));
+
+    static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> insts)
+    {
+        foreach (var inst in insts)
+        {
+            if (inst.Calls(PlayOneShotOnCamera))
+            {
+                yield return new CodeInstruction(OpCodes.Ldarg_0); // Message msg
+                yield return new CodeInstruction(OpCodes.Call, ReplacementMethod);
+            }
+            else
+            {
+                yield return inst;
+            }
+        }
+    }
+
+    // Suppress camera beep for messages that don't belong to our faction
+    static void PlayMessageSoundReplacement(SoundDef sound, Map map, Message msg)
+    {
+        if (sound == null) return;
+        if (Multiplayer.Client == null || Multiplayer.game == null || !Multiplayer.GameComp.multifaction)
+        {
+            sound.PlayOneShotOnCamera(map);
+            return;
+        }
+
+        if (LetterSecurityUtility.IsTargetForFaction(msg.lookTargets, Multiplayer.RealPlayerFaction))
+        {
+            sound.PlayOneShotOnCamera(map);
+        }
     }
 }
 

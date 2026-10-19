@@ -54,6 +54,9 @@ public class SaveableDesyncInfo(
 
             zip.AddEntry("local_metadata.txt", metadata.Result);
 
+            var analysisReport = DesyncDiffAnalyzer.GenerateDiffReport(hostInfo?.Traces, GetLocalTraces(), this);
+            zip.AddEntry("desync_analysis.txt", analysisReport);
+
             try
             {
                 replay.Wait();
@@ -62,7 +65,8 @@ public class SaveableDesyncInfo(
             {
                 if (e.InnerExceptions.SingleOrDefault(inner => inner is TaskCanceledException) == null) throw;
             }
-            if (replay.IsCompletedSuccessfully) {
+            if (replay.IsCompletedSuccessfully)
+            {
                 var replayFile = replay.Result;
                 zip.CreateEntryFromFile(replayFile.FullName, "replay.rwmts", CompressionLevel.NoCompression);
                 DeleteFileSilent(replayFile);
@@ -76,7 +80,7 @@ public class SaveableDesyncInfo(
         Log.Message($"Desync info writing took {watch.ElapsedMilliseconds}");
     }
 
-    private string GetLocalTraces()
+    public string GetLocalTraces()
     {
         var traceMessage = "";
         var localCount = local.desyncStackTraceHashes.Count;

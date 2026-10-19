@@ -9,7 +9,7 @@ namespace Multiplayer.Client
 {
     public class DesyncedWindow : Window
     {
-        const int NumButtons = 5;
+        const int NumButtons = 6;
         const float ButtonsWidth = 120 * NumButtons + 10 * (NumButtons - 1);
 
         public override Vector2 InitialSize => new(30 + 130 * NumButtons, 110);
@@ -85,6 +85,19 @@ namespace Multiplayer.Client
             );
             if (openDesyncsFolder)
                 ShellOpenDirectory.Execute(Multiplayer.DesyncsDir);
+            x += 120 + 10;
+
+            if (Widgets.ButtonText(new Rect(x, 0, 120, 35), "MpDesyncAnalysis".Translate()))
+            {
+                string hostTraces = hostInfo?.Traces;
+                string localTraces = desyncInfo.GetLocalTraces();
+                string report = DesyncDiffAnalyzer.GenerateDiffReport(hostTraces, localTraces, desyncInfo);
+                var reportWindow = new DebugTextWindow(report, UI.screenWidth * 0.85f, UI.screenHeight * 0.85f)
+                {
+                    layer = WindowLayer.Super
+                };
+                Find.WindowStack.Add(reportWindow);
+            }
             x += 120 + 10;
 
             if (Widgets.ButtonText(new Rect(x, 0, 120, 35), "Quit".Translate()))

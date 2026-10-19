@@ -179,10 +179,10 @@ namespace Multiplayer.Client
             Shader.SetGlobalFloat(ShaderPropertyIDs.GameSeconds, Find.CurrentMap.AsyncTime().mapTicks.TicksToSeconds());
         }
 
-        private static bool RunCmds()
+        private static bool RunCmds(List<ITickable> tickables = null)
         {
             int curTimer = Timer;
-            var tickables = GetTickables();
+            tickables ??= GetTickables();
 
             for (int i = 0; i < tickables.Count; i++)
             {
@@ -219,10 +219,12 @@ namespace Multiplayer.Client
 
             while (Simulating ? (Timer < simulating.target && updateTimer.ElapsedMilliseconds < SimulatingSliceBudgetMs) : (ticksToRun > 0))
             {
-                if (RunCmds())
+                var tickables = GetTickables();
+
+                if (RunCmds(tickables))
                     return;
 
-                if (DoTick(ref worked))
+                if (DoTick(ref worked, tickables))
                     return;
             }
         }
@@ -237,10 +239,10 @@ namespace Multiplayer.Client
         }
 
         // Returns whether the tick loop should stop
-        public static bool DoTick(ref bool worked)
+        public static bool DoTick(ref bool worked, List<ITickable> tickables = null)
         {
             tickTimer.Restart();
-            var tickables = GetTickables();
+            tickables ??= GetTickables();
 
             for (int i = 0; i < tickables.Count; i++)
             {
