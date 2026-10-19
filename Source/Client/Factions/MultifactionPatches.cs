@@ -738,18 +738,6 @@ static class TakeToBedGuestFactionPatch
     }
 }
 
-
-[HarmonyPatch(typeof(LetterStack), nameof(LetterStack.ReceiveLetter), typeof(Letter), typeof(string), typeof(int), typeof(bool))]
-static class LetterStackReceiveOnlyMyFaction
-{
-    // todo the letter might get culled from the archive if it isn't in the stack and Sync depends on the archive
-    static void Postfix(LetterStack __instance, Letter let)
-    {
-        if (Multiplayer.RealPlayerFaction != Faction.OfPlayer)
-            __instance.letters.Remove(let);
-    }
-}
-
 public static class LetterSecurityUtility
 {
     public static bool IsTargetForFaction(LookTargets lookTargets, Faction faction)
@@ -1228,16 +1216,34 @@ static class Pawn_TraderTracker_ColonyThingsWillingToBuy_Patch
 [HarmonyPatch(typeof(ResearchManager), nameof(ResearchManager.FinishProject))]
 public static class ResearchManager_FinishProject_Patch
 {
-    public static void Prefix(ref bool doCompletionDialog, ref bool doCompletionLetter, Pawn researcher)
+    public static Faction currentFinishingFaction;
+
+    // Do not modify ref parameters! Let the simulation run exactly the same for everyone.
+    public static void Prefix(Pawn researcher)
     {
         if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction)
             return;
 
-        Faction finishingFaction = researcher?.Faction ?? Faction.OfPlayerSilentFail;
-        if (finishingFaction != null && finishingFaction != Multiplayer.RealPlayerFaction)
+        // Store the faction doing the research in a static variable during the simulation tick.
+        currentFinishingFaction = researcher?.Faction ?? Faction.OfPlayerSilentFail;
+    }
+
+    public static void Postfix()
+    {
+        currentFinishingFaction = null;
+    }
+}
+
+[HarmonyPatch(typeof(LetterStack), nameof(LetterStack.ReceiveLetter), typeof(Letter), typeof(string), typeof(int), typeof(bool))]
+public static class AssignFactionToResearchLetterPatch
+{
+    public static void Prefix(Letter let)
+    {
+        // If a letter is generated during research completion, tag it with the researching faction.
+        // This allows LettersOnGUIFilterPatch to correctly hide it from other players.
+        if (ResearchManager_FinishProject_Patch.currentFinishingFaction != null && let != null)
         {
-            doCompletionDialog = false;
-            doCompletionLetter = false;
+            let.relatedFaction = ResearchManager_FinishProject_Patch.currentFinishingFaction;
         }
     }
 }

@@ -59,7 +59,8 @@ namespace Multiplayer.Client
 
         protected override void ExposeDataSaveLoad()
         {
-            if (Scribe.mode == LoadSaveMode.Saving) {
+            if (Scribe.mode == LoadSaveMode.Saving)
+            {
                 faction = dialog.faction;
             }
             Scribe_References.Look(ref faction, "faction");
@@ -94,7 +95,8 @@ namespace Multiplayer.Client
 
         protected override void ExposeDataSaveLoad()
         {
-            if (Scribe.mode == LoadSaveMode.Saving) {
+            if (Scribe.mode == LoadSaveMode.Saving)
+            {
                 negotiator = dialog.negotiator;
                 faction = dialog.commTarget.GetFaction();
             }
@@ -138,13 +140,14 @@ namespace Multiplayer.Client
         {
             Type target = bindings.TryGetValue(dialog.GetType());
 
-            if (target == null) {
+            if (target == null)
+            {
                 Log.Warning($"Unknown Window Type {target}");
 
                 return null;
             }
 
-            return (PersistentDialog) Activator.CreateInstance(target, map, dialog);
+            return (PersistentDialog)Activator.CreateInstance(target, map, dialog);
         }
 
         public abstract Dialog_NodeTree Dialog { get; }
@@ -179,7 +182,8 @@ namespace Multiplayer.Client
                 .Select(type => new { dialog = FindDialogForType(type), proxy = type })
                 .Where(kvp => kvp.dialog != null);
 
-            foreach (var kvp in types) {
+            foreach (var kvp in types)
+            {
                 bindings.Add(kvp.dialog, kvp.proxy);
             }
         }
@@ -194,7 +198,8 @@ namespace Multiplayer.Client
         {
             var proxy = type.GetTypeWithGenericDefinition(typeof(PersistentDialog<>));
 
-            if (proxy == null || type.IsAbstract || type.IsInterface) {
+            if (proxy == null || type.IsAbstract || type.IsInterface)
+            {
                 return null;
             }
 
@@ -209,15 +214,18 @@ namespace Multiplayer.Client
         /// <param name="proxy">Proxy must wrap the Target.</param>
         public static void Bind(Type target, Type proxy)
         {
-            if (!(typeof(Dialog_NodeTree).IsAssignableFrom(target))) {
+            if (!(typeof(Dialog_NodeTree).IsAssignableFrom(target)))
+            {
                 throw new ArgumentException($"Registered target, {target}, was not assignable from {typeof(Dialog_NodeTree)}");
             }
 
-            if (proxy.IsInterface || proxy.IsAbstract) {
+            if (proxy.IsInterface || proxy.IsAbstract)
+            {
                 throw new ArgumentException($"Registered type, {proxy}, is interface or abstract and cannot be registered");
             }
 
-            if (!(typeof(PersistentDialog)).IsAssignableFrom(proxy)) {
+            if (!(typeof(PersistentDialog)).IsAssignableFrom(proxy))
+            {
                 throw new ArgumentException($"Registered type, {proxy}, was not assignable from {typeof(PersistentDialog)}");
             }
 
@@ -259,7 +267,8 @@ namespace Multiplayer.Client
 
         public override void ExposeData()
         {
-            if (Scribe.mode == LoadSaveMode.Saving) {
+            if (Scribe.mode == LoadSaveMode.Saving)
+            {
                 Scribe_Values.Look(ref id, "id");
                 Scribe_Custom.LookValue(dialog.soundAmbient == SoundDefOf.RadioComms_Ambience, "radioMode");
                 Scribe_Values.Look(ref dialog.title, "title");
@@ -284,7 +293,9 @@ namespace Multiplayer.Client
                 Scribe_Collections.Look(ref saveNodes, "nodes", LookMode.Deep);
 
                 Clean();
-            } else {
+            }
+            else
+            {
                 Scribe_Values.Look(ref id, "id");
                 Scribe_Values.Look(ref radioMode, "radioMode");
                 Scribe_Values.Look(ref title, "title");
@@ -297,7 +308,8 @@ namespace Multiplayer.Client
                 rootNode = saveNodes[0].node;
             }
 
-            if (Scribe.mode == LoadSaveMode.PostLoadInit) {
+            if (Scribe.mode == LoadSaveMode.PostLoadInit)
+            {
                 dialog = ExposeDataInstance(rootNode, radioMode, title);
                 dialog.doCloseX = true;
                 dialog.closeOnCancel = true;
@@ -357,14 +369,16 @@ namespace Multiplayer.Client
 
             public void ExposeData()
             {
-                if (Scribe.mode == LoadSaveMode.Saving) {
+                if (Scribe.mode == LoadSaveMode.Saving)
+                {
                     Scribe_Values.Look(ref node.text, "text");
 
                     var saveOptions = node.options.Select(o => new DiaOptionSave(parent, o)).ToList();
                     Scribe_Collections.Look(ref saveOptions, "options", LookMode.Deep);
                 }
 
-                if (Scribe.mode == LoadSaveMode.LoadingVars) {
+                if (Scribe.mode == LoadSaveMode.LoadingVars)
+                {
                     Scribe_Values.Look(ref text, "text");
                     Scribe_Collections.Look(ref saveOptions, "options", LookMode.Deep, parent);
 
@@ -628,7 +642,16 @@ namespace Multiplayer.Client
 
             PersistentDialog persistentDialog = null;
 
-            if (window is Dialog_NodeTree dialog_NodeTree) {
+            if (window is Dialog_NodeTree dialog_NodeTree)
+            {
+                if (Patches.ResearchManager_FinishProject_Patch.currentFinishingFaction != null)
+                {
+                    // We are inside ResearchManager.FinishProject.
+                    // Do not create a PersistentDialog (which consumes a global ID and causes desync).
+                    // Return true to show it as a local window if it belongs to us, or false to suppress it.
+                    return Patches.ResearchManager_FinishProject_Patch.currentFinishingFaction == Multiplayer.RealPlayerFaction;
+                }
+
                 persistentDialog = PersistentDialog.CreateInstance(map, dialog_NodeTree);
             }
 
@@ -665,7 +688,8 @@ namespace Multiplayer.Client
             if (Multiplayer.Client == null) return true;
             if (!Multiplayer.InInterface) return true;
 
-            if (PersistentDialog.FindDialog(__instance) == null) {
+            if (PersistentDialog.FindDialog(__instance) == null)
+            {
                 return true;
             }
 
