@@ -1225,6 +1225,23 @@ static class Pawn_TraderTracker_ColonyThingsWillingToBuy_Patch
     }
 }
 
+[HarmonyPatch(typeof(ResearchManager), nameof(ResearchManager.FinishProject))]
+public static class ResearchManager_FinishProject_Patch
+{
+    public static void Prefix(ref bool doCompletionDialog, ref bool doCompletionLetter, Pawn researcher)
+    {
+        if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction)
+            return;
+
+        Faction finishingFaction = researcher?.Faction ?? Faction.OfPlayerSilentFail;
+        if (finishingFaction != null && finishingFaction != Multiplayer.RealPlayerFaction)
+        {
+            doCompletionDialog = false;
+            doCompletionLetter = false;
+        }
+    }
+}
+
 [HarmonyPatch]
 static class TradeUtility_AllLaunchableThingsForTrade_Patch
 {
