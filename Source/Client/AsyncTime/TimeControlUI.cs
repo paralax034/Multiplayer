@@ -391,9 +391,46 @@ public static class ColonistBarTimeControl
 
     static List<FloatMenuOption> GetBlockingWindowOptions(ColonistBar.Entry entry, ITickable tickable)
     {
-        return Multiplayer.WorldComp.sessionManager.AllSessions
-            .ConcatIfNotNull(entry.map?.MpComp().sessionManager.AllSessions)
-            .Select(s => s.GetBlockingWindowOptions(entry)).AllNotNull().ToList();
+        var worldSessions = Multiplayer.WorldComp?.sessionManager;
+        var mapSessions = entry.map?.MpComp()?.sessionManager;
+
+        bool hasWorldSessions = worldSessions != null && worldSessions.AnySessionActive;
+        bool hasMapSessions = mapSessions != null && mapSessions.AnySessionActive;
+
+        if (!hasWorldSessions && !hasMapSessions)
+            return null;
+
+        List<FloatMenuOption> result = null;
+
+        if (hasWorldSessions)
+        {
+            var sessions = worldSessions.AllSessions;
+            for (int i = 0; i < sessions.Count; i++)
+            {
+                var opt = sessions[i].GetBlockingWindowOptions(entry);
+                if (opt != null)
+                {
+                    result ??= new List<FloatMenuOption>();
+                    result.Add(opt);
+                }
+            }
+        }
+
+        if (hasMapSessions)
+        {
+            var sessions = mapSessions.AllSessions;
+            for (int i = 0; i < sessions.Count; i++)
+            {
+                var opt = sessions[i].GetBlockingWindowOptions(entry);
+                if (opt != null)
+                {
+                    result ??= new List<FloatMenuOption>();
+                    result.Add(opt);
+                }
+            }
+        }
+
+        return result;
     }
 
     static void SwitchToMapOrWorld(Map map)

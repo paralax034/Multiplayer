@@ -54,8 +54,10 @@ namespace Multiplayer.Common
 
         public void Tick()
         {
-            var managersSnapshot = netManagers.ToArray();
-            foreach (var (_, man) in managersSnapshot) man.PollEvents();
+            for (int i = 0; i < netManagers.Count; i++)
+            {
+                netManagers[i].manager.PollEvents();
+            }
         }
 
         public void Stop()

@@ -47,11 +47,30 @@ public class AsyncWorldTimeComp : IExposable, ITickable
     // Run at the speed of the fastest map or at chosen speed if there are no maps
     public TimeSpeed DesiredTimeSpeed
     {
-        get => !Find.Maps.Any()
-            ? timeSpeedInt
-            : Find.Maps.Select(m => m.AsyncTime())
-                .Where(a => a.ActualRateMultiplier(a.DesiredTimeSpeed) != 0f)
-                .Max(a => a?.DesiredTimeSpeed) ?? TimeSpeed.Paused;
+        get
+        {
+            var maps = Find.Maps;
+            if (maps == null || maps.Count == 0)
+                return timeSpeedInt;
+
+            TimeSpeed maxSpeed = TimeSpeed.Paused;
+            bool anyUnpaused = false;
+
+            for (int i = 0; i < maps.Count; i++)
+            {
+                var asyncTime = maps[i].AsyncTime();
+                if (asyncTime != null && asyncTime.ActualRateMultiplier(asyncTime.DesiredTimeSpeed) != 0f)
+                {
+                    if (!anyUnpaused || asyncTime.DesiredTimeSpeed > maxSpeed)
+                    {
+                        maxSpeed = asyncTime.DesiredTimeSpeed;
+                        anyUnpaused = true;
+                    }
+                }
+            }
+
+            return anyUnpaused ? maxSpeed : TimeSpeed.Paused;
+        }
         set => timeSpeedInt = value;
     }
 
@@ -237,13 +256,13 @@ public class AsyncWorldTimeComp : IExposable, ITickable
 
                 var prev = -1;
                 if (previousMapId >= 0)
-                    prev = Find.Maps.FirstOrDefault(x => x.uniqueID == previousMapId)?.AsyncTime()?.DecreasePlayerCount() ?? -1;
+                    prev = Find.Maps.GetById(previousMapId)?.AsyncTime()?.DecreasePlayerCount() ?? -1;
                 else if (previousMapId == VTRSync.WorldMapId)
                     prev = Multiplayer.AsyncWorldTime.CurrentPlayerCount -= 1;
 
                 var curr = -1;
                 if (newMapId >= 0)
-                    curr = Find.Maps.FirstOrDefault(x => x.uniqueID == newMapId)?.AsyncTime()?.IncreasePlayerCount() ?? -1;
+                    curr = Find.Maps.GetById(newMapId)?.AsyncTime()?.IncreasePlayerCount() ?? -1;
                 else if (newMapId == VTRSync.WorldMapId)
                     curr = Multiplayer.AsyncWorldTime.CurrentPlayerCount += 1;
 

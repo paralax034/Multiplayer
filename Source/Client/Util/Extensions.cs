@@ -283,6 +283,22 @@ namespace Multiplayer.Client
             if (list == null) return "";
             var builder = new StringBuilder();
             var useSeparator = false;
+
+            if (list is IList iList)
+            {
+                for (int i = 0; i < iList.Count; i++)
+                {
+                    var elem = iList[i];
+                    if (useSeparator) builder.Append(separator);
+                    useSeparator = true;
+                    if (elem != null || explicitNullValues)
+                    {
+                        builder.Append(elem != null ? elem.ToString() : "[null]");
+                    }
+                }
+                return builder.ToString();
+            }
+
             foreach (var elem in list)
             {
                 if (useSeparator) builder.Append(separator);

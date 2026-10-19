@@ -27,6 +27,7 @@ namespace Multiplayer.Client
         public static int frozenAt;
 
         public const float StandardTimePerFrame = 1000.0f / 60.0f;
+        private const int SimulatingSliceBudgetMs = 45;
 
         // Time is in milliseconds
         private static float realTime;
@@ -212,12 +213,15 @@ namespace Multiplayer.Client
         public static void DoUpdate(out bool worked)
         {
             worked = false;
-            updateTimer.Restart();
 
-            while (Simulating ? (Timer < simulating.target && updateTimer.ElapsedMilliseconds < 25) : (ticksToRun > 0))
+            updateTimer.Reset();
+            updateTimer.Start();
+
+            while (Simulating ? (Timer < simulating.target && updateTimer.ElapsedMilliseconds < SimulatingSliceBudgetMs) : (ticksToRun > 0))
             {
                 if (RunCmds())
                     return;
+
                 if (DoTick(ref worked))
                     return;
             }

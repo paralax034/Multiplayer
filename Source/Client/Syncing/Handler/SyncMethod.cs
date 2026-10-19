@@ -170,8 +170,14 @@ namespace Multiplayer.Client
                 if (argTransformers[i] is { } trans)
                     args[i] = trans.reader.DynamicInvoke(SyncSerialization.ReadSyncObject(data, trans.networkType));
 
-            if (cancelIfAnyArgNull && args.Any(a => a == null))
-                return;
+            if (cancelIfAnyArgNull)
+            {
+                for (int i = 0; i < args.Length; i++)
+                {
+                    if (args[i] == null)
+                        return;
+                }
+            }
 
             if (context.HasFlag(SyncContext.MapSelected) && cancelIfNoSelectedMapObjects && Find.Selector.selected.Count == 0)
                 return;

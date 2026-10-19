@@ -92,7 +92,16 @@ namespace Multiplayer.Client
 
                 var unassignSerializer = Serializer.New(
                     (Pawn pawn, object target, object[] _) => (pawnId: pawn.thingIDNumber, target: (CompAssignableToPawn)target),
-                    tuple => tuple.target.assignedPawns.FirstOrDefault(p => p.thingIDNumber == tuple.pawnId));
+                    tuple =>
+                    {
+                        var pawns = tuple.target.assignedPawns;
+                        for (int i = 0; i < pawns.Count; i++)
+                        {
+                            if (pawns[i].thingIDNumber == tuple.pawnId)
+                                return pawns[i];
+                        }
+                        return null;
+                    });
 
                 foreach (var method in assignMethods) {
                     Sync.RegisterSyncMethod(method).CancelIfAnyArgNull();
@@ -215,7 +224,20 @@ namespace Multiplayer.Client
                 (TransferableOneWay t, object target, object[] args) =>
                     (((ITab_ContentsTransporter)target).Transporter, t.AnyThing.thingIDNumber),
                 data =>
-                    data.Transporter.leftToLoad.Find(t => t.things.Any(thing => thing.thingIDNumber == data.thingIDNumber))
+                {
+                    var leftToLoad = data.Transporter.leftToLoad;
+                    for (int i = 0; i < leftToLoad.Count; i++)
+                    {
+                        var transferable = leftToLoad[i];
+                        var things = transferable.things;
+                        for (int j = 0; j < things.Count; j++)
+                        {
+                            if (things[j].thingIDNumber == data.thingIDNumber)
+                                return transferable;
+                        }
+                    }
+                    return null;
+                }
             );
 
             SyncMethod.Register(typeof(ITab_ContentsTransporter), nameof(ITab_ContentsTransporter.OnDropThing)).SetContext(SyncContext.MapSelected); // overriden ITab_ContentsBase.OnDropThing

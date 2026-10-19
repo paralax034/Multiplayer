@@ -11,16 +11,16 @@ namespace Multiplayer.Client.Persistent;
 
 public class SessionManager : IHasSessionData, ISessionManager
 {
-    public IReadOnlyList<Session> AllSessions => allSessions.AsReadOnly();
-    public IReadOnlyList<ExposableSession> ExposableSessions => exposableSessions.AsReadOnly();
-    public IReadOnlyList<SemiPersistentSession> SemiPersistentSessions => semiPersistentSessions.AsReadOnly();
-    public IReadOnlyList<ITickingSession> TickingSessions => tickingSessions.AsReadOnly();
+    public IReadOnlyList<Session> AllSessions => allSessions;
+    public IReadOnlyList<ExposableSession> ExposableSessions => exposableSessions;
+    public IReadOnlyList<SemiPersistentSession> SemiPersistentSessions => semiPersistentSessions;
+    public IReadOnlyList<ITickingSession> TickingSessions => tickingSessions;
 
-    private List<Session> allSessions = new();
-    private List<ExposableSession> exposableSessions = new();
-    private List<SemiPersistentSession> semiPersistentSessions = new();
-    private List<ITickingSession> tickingSessions = new();
-    private static HashSet<Type> tempCleanupLoggingTypes = new();
+    private List<Session> allSessions = [];
+    private List<ExposableSession> exposableSessions = [];
+    private List<SemiPersistentSession> semiPersistentSessions = [];
+    private List<ITickingSession> tickingSessions = [];
+    private static readonly HashSet<Type> tempCleanupLoggingTypes = [];
 
     public Map Map { get; }
     public bool AnySessionActive => allSessions.Count > 0;
@@ -111,9 +111,15 @@ public class SessionManager : IHasSessionData, ISessionManager
 
     private Session GetFirstConflictingSession(Session session)
     {
-        // Should the check be two-way? A property for optional two-way check?
+        // Should the check be two-way ? A property for optional two-way check ?
         if (session is ISessionWithCreationRestrictions restrictions)
-            return allSessions.FirstOrDefault(s => !restrictions.CanExistWith(s));
+        {
+            for (int i = 0; i < allSessions.Count; i++)
+            {
+                if (!restrictions.CanExistWith(allSessions[i]))
+                    return allSessions[i];
+            }
+        }
 
         return null;
     }
@@ -127,13 +133,49 @@ public class SessionManager : IHasSessionData, ISessionManager
             tickingSessions[i].Tick();
     }
 
-    public T GetFirstOfType<T>() where T : Session => allSessions.OfType<T>().FirstOrDefault();
+    public T GetFirstOfType<T>() where T : Session
+    {
+        for (int i = 0; i < allSessions.Count; i++)
+        {
+            if (allSessions[i] is T match)
+                return match;
+        }
 
-    public T GetFirstOfType<T>(Func<T, bool> predicate) where T : Session => allSessions.OfType<T>().FirstOrDefault(predicate);
+        return null;
+    }
 
-    public T GetFirstWithId<T>(int id) where T : Session => allSessions.OfType<T>().FirstOrDefault(s => s.SessionId == id);
+    public T GetFirstOfType<T>(Func<T, bool> predicate) where T : Session
+    {
+        for (int i = 0; i < allSessions.Count; i++)
+        {
+            if (allSessions[i] is T match && predicate(match))
+                return match;
+        }
 
-    public Session GetFirstWithId(int id) => allSessions.FirstOrDefault(s => s.SessionId == id);
+        return null;
+    }
+
+    public T GetFirstWithId<T>(int id) where T : Session
+    {
+        for (int i = 0; i < allSessions.Count; i++)
+        {
+            if (allSessions[i].SessionId == id && allSessions[i] is T match)
+                return match;
+        }
+
+        return null;
+    }
+
+    public Session GetFirstWithId(int id)
+    {
+        for (int i = 0; i < allSessions.Count; i++)
+        {
+            if (allSessions[i].SessionId == id)
+                return allSessions[i];
+        }
+
+        return null;
+    }
 
     public void WriteSessionData(ByteWriter data)
     {
@@ -222,10 +264,10 @@ public class SessionManager : IHasSessionData, ISessionManager
 
         if (Scribe.mode == LoadSaveMode.PostLoadInit)
         {
-            allSessions ??= new();
-            exposableSessions ??= new();
-            semiPersistentSessions ??= new();
-            tickingSessions ??= new();
+            allSessions ??= [];
+            exposableSessions ??= [];
+            semiPersistentSessions ??= [];
+            tickingSessions ??= [];
 
             // Clear the set to make sure it's empty
             tempCleanupLoggingTypes.Clear();
@@ -261,7 +303,7 @@ public class SessionManager : IHasSessionData, ISessionManager
     {
         for (int i = 0; i < allSessions.Count; i++)
         {
-            if (AllSessions[i].IsCurrentlyPausing(map))
+            if (allSessions[i].IsCurrentlyPausing(map))
                 return true;
         }
 

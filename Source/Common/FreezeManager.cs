@@ -4,7 +4,7 @@ using Verse;
 
 namespace Multiplayer.Common
 {
-    public class FreezeManager
+    public class FreezeManager(MultiplayerServer server)
     {
         private bool frozen;
 
@@ -18,18 +18,29 @@ namespace Multiplayer.Common
             }
         }
 
-        public MultiplayerServer Server { get; }
-
-        public FreezeManager(MultiplayerServer server)
-        {
-            Server = server;
-        }
+        public MultiplayerServer Server { get; } = server;
 
         private const int MaxFreezeWaitTime = GenTicks.TicksPerRealSecond * 10; // 10 seconds
 
         public void Tick()
         {
-            var hostPlayer = Server.PlayingPlayers.FirstOrDefault(p => p.IsHost);
+            ServerPlayer hostPlayer = null!;
+            bool anyPlayingFrozen = false;
+            bool anyPlaying = false;
+
+            var players = Server.playerManager.Players;
+            for (int i = 0; i < players.Count; i++)
+            {
+                var p = players[i];
+                if (p.IsPlaying)
+                {
+                    anyPlaying = true;
+                    if (p.IsHost)
+                        hostPlayer = p;
+                    if (p.frozen)
+                        anyPlayingFrozen = true;
+                }
+            }
 
             if (hostPlayer != null)
             {
@@ -37,13 +48,13 @@ namespace Multiplayer.Common
                 if (!Frozen && hostPlayer.frozen)
                     Frozen = true;
 
-                if (Frozen && !hostPlayer.frozen && (!Server.PlayingPlayers.Any(p => p.frozen) || Server.NetTimer - hostPlayer.unfrozenAt > MaxFreezeWaitTime))
+                if (Frozen && !hostPlayer.frozen && (!anyPlayingFrozen || Server.NetTimer - hostPlayer.unfrozenAt > MaxFreezeWaitTime))
                     Frozen = false;
             }
             else
             {
                 // Host is absent: unfreeze if any player is active
-                if (Frozen && Server.PlayingPlayers.Any())
+                if (Frozen && anyPlaying)
                     Frozen = false;
             }
         }
