@@ -23,6 +23,8 @@ public class AsyncWorldTimeComp : IExposable, ITickable
 
     public float TimeToTickThrough { get; set; }
 
+    private int prevTicksGame;
+
     public float TickRateMultiplier(TimeSpeed speed)
     {
         if (Multiplayer.GameComp.asyncTime)
@@ -162,6 +164,10 @@ public class AsyncWorldTimeComp : IExposable, ITickable
 
     public void PreContext()
     {
+        // Synchronize engine TicksGame with worldTicks to prevent map ticks from corrupting world pawn interval math
+        prevTicksGame = Find.TickManager.TicksGame;
+        Find.TickManager.DebugSetTicksGame(worldTicks);
+
         Find.TickManager.CurTimeSpeed = DesiredTimeSpeed;
         Rand.PushState();
         Rand.StateCompressed = randState;
@@ -185,6 +191,9 @@ public class AsyncWorldTimeComp : IExposable, ITickable
 
         randState = Rand.StateCompressed;
         Rand.PopState();
+
+        // Restore previous TicksGame context
+        Find.TickManager.DebugSetTicksGame(prevTicksGame);
     }
 
     public void ExecuteCmd(ScheduledCommand cmd)
@@ -258,7 +267,7 @@ public class AsyncWorldTimeComp : IExposable, ITickable
                 if (previousMapId >= 0)
                     prev = Find.Maps.GetById(previousMapId)?.AsyncTime()?.DecreasePlayerCount() ?? -1;
                 else if (previousMapId == VTRSync.WorldMapId)
-                    prev = Multiplayer.AsyncWorldTime.CurrentPlayerCount -= 1;
+                    prev = Multiplayer.AsyncWorldTime.CurrentPlayerCount = Math.Max(0, Multiplayer.AsyncWorldTime.CurrentPlayerCount - 1);
 
                 var curr = -1;
                 if (newMapId >= 0)

@@ -32,6 +32,12 @@ namespace Multiplayer.Common
         public const char EndpointSeparator = '&';
         public const int NetTicksPerSecond = 30; // Not an exact amount. The net loop isn't particularly precise.
 
+        // Adaptive network lag thresholds and multipliers
+        public const int LagSlowdownMinTicks = 30;
+        public const int LagSlowdownMaxTicks = 120;
+        public const int LagCriticalThresholdTicks = 300;
+        public const float MaxSlowdownMultiplier = 2.0f;
+
         public static readonly Regex UsernamePattern = new(@"^[a-zA-Z0-9_]+$");
 
         public WorldData worldData;
@@ -100,7 +106,8 @@ namespace Multiplayer.Common
             Stopwatch tickTime = Stopwatch.StartNew();
             double realTime = 0;
 
-            List<ServerPlayer> playersBehind = [];
+            int lastPauseLogTimer = 0;
+
             while (running)
             {
                 try
@@ -119,29 +126,64 @@ namespace Multiplayer.Common
                     int ticked = 0;
                     while (realTime > 0 && ticked < 2)
                     {
-                        playersBehind.Clear();
-                        playersBehind.AddRange(PlayingIngamePlayers.Where(p => p.ExtrapolatedTicksBehind > 90));
-                        if (!freezeManager.Frozen &&
-                            PlayingPlayers.Any(p => p.ExtrapolatedTicksBehind < 40) &&
-                            !playersBehind.Any())
+                        // Zero-allocation flat iteration across players
+                        var players = playerManager.Players;
+                        int maxExtrapolated = 0;
+                        int maxTicksBehind = 0;
+                        bool anyIngame = false;
+                        string criticalLagPlayer = null!;
+
+                        for (int i = 0; i < players.Count; i++)
+                        {
+                            var p = players[i];
+                            if (!p.IsPlaying) continue;
+                            if (p.status != PlayerStatus.Playing) continue;
+
+                            anyIngame = true;
+                            int extrap = p.ExtrapolatedTicksBehind;
+                            if (extrap > maxExtrapolated)
+                            {
+                                maxExtrapolated = extrap;
+                                if (extrap > LagCriticalThresholdTicks)
+                                    criticalLagPlayer = p.Username;
+                            }
+
+                            if (p.ticksBehind > maxTicksBehind)
+                                maxTicksBehind = p.ticksBehind;
+                        }
+
+                        // Hard pause only on critical lag or freeze, requiring at least one fully joined playing player
+                        bool canAdvance = !freezeManager.Frozen && anyIngame && maxExtrapolated <= LagCriticalThresholdTicks;
+
+                        if (canAdvance)
                         {
                             gameTimer++;
                             sentCmdsSnapshot = commands.SentCmds;
+
+                            // Linear slowdown from 1x down to 0.5x between LagSlowdownMinTicks and LagSlowdownMaxTicks
+                            float slowdown = 0f;
+                            if (maxExtrapolated > LagSlowdownMinTicks)
+                            {
+                                float lagProgress = (float)(maxExtrapolated - LagSlowdownMinTicks) / (LagSlowdownMaxTicks - LagSlowdownMinTicks);
+                                slowdown = Math.Min(lagProgress, MaxSlowdownMultiplier);
+                            }
+
+                            realTime -= serverTimePerTick * (1f + slowdown);
+                            ticked++;
                         }
-                        else if (playersBehind.Any())
+                        else
                         {
-                            var text = playersBehind.Join(p => $"{p.Username}");
-                            ServerLog.Log($"Simulation paused because some players are too far behind: {text}");
+                            // Throttle logging to once per second to avoid IO stall
+                            if (criticalLagPlayer != null && NetTimer - lastPauseLogTimer >= NetTicksPerSecond)
+                            {
+                                lastPauseLogTimer = NetTimer;
+                                ServerLog.Log($"Simulation paused because player is too far behind: {criticalLagPlayer} ({maxExtrapolated} ticks)");
+                            }
+
+                            // Discard accumulated time during pause so the server does not fast-forward on resume
+                            realTime = 0;
+                            break;
                         }
-
-                        // Run up to three times slower depending on max ticksBehind
-                        var slowdown = Math.Min(
-                            PlayingIngamePlayers.MaxOrZero(p => p.ticksBehind) / 60f,
-                            2f
-                        );
-                        realTime -= serverTimePerTick * (1f + slowdown);
-
-                        ticked++;
                     }
 
                     if (realTime > 0)
@@ -179,11 +221,14 @@ namespace Multiplayer.Common
             if (NetTimer % NetTicksPerSecond == 0)
                 playerManager.SendLatencies();
 
-
             if (NetTimer % (NetTicksPerSecond / 5) == 0)
             {
-                foreach (var player in JoinedPlayers) {
-                    player.SendKeepAlivePacket();
+                var players = playerManager.Players;
+                for (int i = 0; i < players.Count; i++)
+                {
+                    var player = players[i];
+                    if (player.HasJoined)
+                        player.SendKeepAlivePacket();
                 }
             }
 
@@ -191,7 +236,18 @@ namespace Multiplayer.Common
             // during the same simulation.
             SendToPlaying(new ServerTimeControlPacket(gameTimer, sentCmdsSnapshot, serverTimePerTick), false);
 
-            serverTimePerTick = PlayingIngamePlayers.MaxOrZero(p => p.frameTime);
+            float maxFrameTime = 0f;
+            var playerList = playerManager.Players;
+            for (int i = 0; i < playerList.Count; i++)
+            {
+                var p = playerList[i];
+                if (p.IsPlaying && p.status == PlayerStatus.Playing && p.frameTime > maxFrameTime)
+                {
+                    maxFrameTime = p.frameTime;
+                }
+            }
+
+            serverTimePerTick = maxFrameTime;
 
             if (serverTimePerTick < StandardTimePerTick)
                 serverTimePerTick = StandardTimePerTick;
@@ -218,17 +274,25 @@ namespace Multiplayer.Common
         public void SendToPlaying<T>(T packet, bool reliable = true, ServerPlayer? excluding = null) where T : IPacket
         {
             var serialized = packet.Serialize();
-            foreach (ServerPlayer player in PlayingPlayers)
-                if (player != excluding)
+            var players = playerManager.Players;
+            for (int i = 0; i < players.Count; i++)
+            {
+                var player = players[i];
+                if (player.IsPlaying && player != excluding)
                     player.conn.Send(serialized, reliable);
+            }
         }
 
         public void SendToIngame<T>(T packet, bool reliable = true, ServerPlayer? excluding = null) where T : IPacket
         {
             var serialized = packet.Serialize();
-            foreach (ServerPlayer player in PlayingIngamePlayers)
-                if (player != excluding)
+            var players = playerManager.Players;
+            for (int i = 0; i < players.Count; i++)
+            {
+                var player = players[i];
+                if (player.IsPlaying && player.status == PlayerStatus.Playing && player != excluding)
                     player.conn.Send(serialized, reliable);
+            }
         }
 
         public bool CanUseStandaloneMapStreaming(int mapId) => false;

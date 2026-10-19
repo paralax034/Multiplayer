@@ -243,14 +243,26 @@ public static class ColonistBarCheckRecacheEntriesPatch
         }
     }
 
+    private static readonly List<Map> tmpFilteredMaps = new(8);
+
     public static IEnumerable<Map> GetFilteredMaps()
     {
         if (Multiplayer.Client == null || !Multiplayer.settings.hideOtherPlayersInColonistBar)
             return Find.Maps;
 
-        return Find.Maps.Where(map =>
-            map.mapPawns.FreeColonistsSpawned.Any() ||
-            map.Parent?.Faction == Faction.OfPlayer);
+        tmpFilteredMaps.Clear();
+        var maps = Find.Maps;
+        for (int i = 0; i < maps.Count; i++)
+        {
+            var map = maps[i];
+            // Indexed check without LINQ Where/Any allocations
+            if (map.mapPawns.FreeColonistsSpawned.Count > 0 || map.Parent?.Faction == Faction.OfPlayer)
+            {
+                tmpFilteredMaps.Add(map);
+            }
+        }
+
+        return tmpFilteredMaps;
     }
 }
 
@@ -291,6 +303,38 @@ static class MainButtonsRootDoButtonsPatch
 
     private static readonly Dictionary<string, int> SpectatorButtonOrder = SpectatorButtons.Select((name, idx) => new { name, idx }).ToDictionary(x => x.name, x => x.idx);
 
+    private static bool wasSpectator;
+    private static List<MainButtonDef> cachedOriginalButtons;
+    private static List<MainButtonDef> cachedSpectatorButtons;
+    private static readonly Comparison<MainButtonDef> MainButtonOrderComparer = (a, b) => a.order.CompareTo(b.order);
+
+    private static void EnsureButtonsCached(MainButtonsRoot instance)
+    {
+        if (cachedOriginalButtons == null)
+        {
+            var allDefs = DefDatabase<MainButtonDef>.AllDefsListForReading;
+            cachedOriginalButtons = new List<MainButtonDef>(allDefs.Count);
+            for (int i = 0; i < allDefs.Count; i++)
+            {
+                var def = allDefs[i];
+                if (def.order >= 0)
+                    cachedOriginalButtons.Add(def);
+            }
+            cachedOriginalButtons.Sort(MainButtonOrderComparer);
+        }
+
+        if (cachedSpectatorButtons == null)
+        {
+            cachedSpectatorButtons = new List<MainButtonDef>(SpectatorButtons.Length);
+            for (int i = 0; i < SpectatorButtons.Length; i++)
+            {
+                var defName = SpectatorButtons[i];
+                var def = DefDatabase<MainButtonDef>.GetNamedSilentFail(defName);
+                if (def != null)
+                    cachedSpectatorButtons.Add(def);
+            }
+        }
+    }
     [HarmonyPrefix]
     private static bool ReplaceOriginalDrawing(MainButtonsRoot __instance)
     {
@@ -323,29 +367,13 @@ static class MainButtonsRootDoButtonsPatch
     {
         try
         {
-            var allButtons = AllButtonsRef(__instance);
-            if (allButtons == null)
-                return;
-
-            if (IsSpectator)
+            bool spectator = IsSpectator;
+            // Update list only when spectator state toggles or initial load occurs to eliminate per-frame GC allocations
+            if (spectator != wasSpectator || AllButtonsRef(__instance) == null)
             {
-                // Keep only SpectatorButtons, sorted by our map
-                var filtered = allButtons
-                    .Where(b => SpectatorButtonOrder.ContainsKey(b.defName))
-                    .OrderBy(b => SpectatorButtonOrder[b.defName])
-                    .ToList();
-
-                AllButtonsRef(__instance) = filtered;
-            }
-            else
-            {
-                // Restore original full list in normal mode
-                var original = DefDatabase<MainButtonDef>.AllDefsListForReading
-                    .Where(b => b.order >= 0)
-                    .OrderBy(b => b.order)
-                    .ToList();
-
-                AllButtonsRef(__instance) = original;
+                wasSpectator = spectator;
+                EnsureButtonsCached(__instance);
+                AllButtonsRef(__instance) = spectator ? cachedSpectatorButtons : cachedOriginalButtons;
             }
         }
         catch (Exception ex)
@@ -713,9 +741,19 @@ static class IsActiveThreatToAnyPlayer
 {
     static void Postfix(IAttackTarget target, ref bool __result)
     {
-        foreach (var f in Find.FactionManager.AllFactions)
-            if (f.IsPlayer)
-                __result |= GenHostility.IsActiveThreatTo(target, f);
+        if (__result) return;
+
+        // Use indexed loop over reading list to prevent IEnumerator allocation in frequent threat checks
+        var factions = Find.FactionManager.AllFactionsListForReading;
+        for (int i = 0; i < factions.Count; i++)
+        {
+            var f = factions[i];
+            if (f.IsPlayer && GenHostility.IsActiveThreatTo(target, f))
+            {
+                __result = true;
+                return;
+            }
+        }
     }
 }
 
@@ -740,9 +778,20 @@ public static class LetterSecurityUtility
     {
         if (faction == null) return true;
         if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction) return true;
-        if (lookTargets?.targets == null || lookTargets.targets.Count == 0) return true;
+
+        // If message has no explicit targets (e.g. GameCondition eclipse end), isolate it to the current ticking map's owner
+        if (lookTargets?.targets == null || lookTargets.targets.Count == 0)
+        {
+            var activeMap = Multiplayer.MapContext ?? Find.CurrentMap;
+            if (activeMap?.ParentFaction is { IsPlayer: true } mapOwner)
+            {
+                return mapOwner == faction;
+            }
+            return true;
+        }
 
         bool hasAnyPlayerAffiliation = false;
+        bool hasAnyValidTarget = false;
         var targets = lookTargets.targets;
 
         for (int i = 0; i < targets.Count; i++)
@@ -758,10 +807,17 @@ public static class LetterSecurityUtility
                     targetFaction = tf;
                 else if (thing.Map?.ParentFaction is { IsPlayer: true } mf)
                     targetFaction = mf;
+                else if (thing.MapHeld?.ParentFaction is { IsPlayer: true } mhf)
+                    targetFaction = mhf;
+
+                // A Thing is a valid anchor if it belongs to a player, or is currently spawned on a map.
+                if (thing.Faction is { IsPlayer: true } || thing.Map != null || thing.MapHeld != null)
+                    hasAnyValidTarget = true;
             }
             // Target is a WorldObject (Caravan, Settlement, MapParent)
             else if (target.HasWorldObject && target.WorldObject != null)
             {
+                hasAnyValidTarget = true;
                 var worldObj = target.WorldObject;
                 if (worldObj.Faction is { IsPlayer: true } wf)
                     targetFaction = wf;
@@ -771,7 +827,13 @@ public static class LetterSecurityUtility
             // Target is a cell on a player map
             else if (target.Map?.ParentFaction is { IsPlayer: true } cellMapFac)
             {
+                hasAnyValidTarget = true;
                 targetFaction = cellMapFac;
+            }
+            else
+            {
+                // Fallback for abstract targets (like raw world tiles) to prevent accidental hiding
+                hasAnyValidTarget = true;
             }
 
             if (targetFaction != null)
@@ -782,8 +844,12 @@ public static class LetterSecurityUtility
             }
         }
 
-        // If the event targets another player's colony/caravan, hide it completely.
-        // If it targets an unowned wild location with no player presence, treat as public.
+        // If all targeted Things are despawned NPCs (e.g. guests who left the map), they lose their map affiliation.
+        // Hide the letter to prevent it from falling back to global and appearing on other players' screens.
+        if (!hasAnyValidTarget)
+            return false;
+
+        // If the event targets another player's colony/caravan, hide it completely
         return !hasAnyPlayerAffiliation;
     }
 
@@ -799,6 +865,7 @@ public static class LetterSecurityUtility
                 return questFaction == faction;
         }
 
+        // Target location on a player map takes precedence over relatedFaction to prevent cross-settlement letter leaks
         if (let.lookTargets?.targets != null && let.lookTargets.targets.Count > 0)
         {
             return IsTargetForFaction(let.lookTargets, faction);
@@ -1213,6 +1280,7 @@ static class IgnoreSpectatorWorldPawnsTickPatch
     }
 
     private static readonly List<Pawn> tmpFiltered = new();
+    private static readonly Comparison<Pawn> PawnIdComparer = (a, b) => a.thingIDNumber.CompareTo(b.thingIDNumber);
 
     public static IEnumerable<Pawn> FilterPawnsAlive(HashSet<Pawn> pawns)
     {
@@ -1229,6 +1297,9 @@ static class IgnoreSpectatorWorldPawnsTickPatch
             if (p != null && p.Faction != spectator)
                 tmpFiltered.Add(p);
         }
+
+        // Sort deterministically using cached delegate to prevent iteration divergence across clients
+        tmpFiltered.Sort(PawnIdComparer);
         return tmpFiltered;
     }
 }
@@ -1290,11 +1361,12 @@ public static class ResearchManager_FinishProject_Patch
         if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction)
             return;
 
-        // Store the faction doing the research in a static variable during the simulation tick.
-        currentFinishingFaction = researcher?.Faction ?? Faction.OfPlayerSilentFail;
+        // Resolve researching faction: researcher -> current map owner -> active player faction fallback
+        currentFinishingFaction = researcher?.Faction ?? Multiplayer.MapContext?.ParentFaction ?? Faction.OfPlayerSilentFail;
     }
 
-    public static void Postfix()
+    // Harmony finalizers guarantee execution even if FinishProject throws an unhandled exception
+    public static void Finalizer()
     {
         currentFinishingFaction = null;
     }

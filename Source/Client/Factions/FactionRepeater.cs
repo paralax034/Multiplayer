@@ -168,6 +168,41 @@ namespace Multiplayer.Client
             );
     }
 
+    [HarmonyPatch(typeof(Storyteller), nameof(Storyteller.AllIncidentTargets), MethodType.Getter)]
+    static class StorytellerAllIncidentTargetsPatch
+    {
+        private static readonly List<IIncidentTarget> tmpTargets = new(8);
+
+        // Prevent a faction's storyteller from firing incidents on another player's settlement
+        public static void Postfix(ref IEnumerable<IIncidentTarget> __result)
+        {
+            if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction)
+                return;
+
+            var currentFaction = Faction.OfPlayer;
+            if (currentFaction == null || currentFaction == Multiplayer.WorldComp.spectatorFaction)
+                return;
+
+            tmpTargets.Clear();
+            var maps = Find.Maps;
+            for (int i = 0; i < maps.Count; i++)
+            {
+                var map = maps[i];
+                // Only target maps that belong to the active player faction
+                if (map.ParentFaction == currentFaction)
+                {
+                    tmpTargets.Add(map);
+                }
+            }
+
+            // Global world events (quests, world sites) remain accessible
+            if (Find.World != null)
+                tmpTargets.Add(Find.World);
+
+            __result = tmpTargets;
+        }
+    }
+
     [HarmonyPatch(typeof(StoryWatcher), nameof(StoryWatcher.StoryWatcherTick))]
     static class StoryWatcherTickPatch
     {

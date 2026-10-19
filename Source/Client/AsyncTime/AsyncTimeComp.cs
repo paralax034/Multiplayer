@@ -444,6 +444,7 @@ namespace Multiplayer.Client
         }
 
         private bool nothingHappeningCached;
+        private const int NothingHappeningCheckIntervalTicks = 30;
 
         private void CacheNothingHappening()
         {
@@ -452,24 +453,25 @@ namespace Multiplayer.Client
             if (timeSpeedInt != TimeSpeed.Superfast || TickPatch.Simulating)
                 return;
 
-            // Check at most once every 30 ticks instead of every single tick.
-            if (mapTicks % 30 != 0)
+            // Check at most once every 30 ticks instead of every single tick
+            if (mapTicks % NothingHappeningCheckIntervalTicks != 0)
                 return;
 
             nothingHappeningCached = true;
-            var list = map.mapPawns.SpawnedPawnsInFaction(Faction.OfPlayer);
+            var list = map.mapPawns.AllPawnsSpawned;
 
+            // Check all player-owned humanlikes on map regardless of specific player faction (multifaction safe)
             for (int i = 0; i < list.Count; i++)
             {
                 var pawn = list[i];
-                if (pawn.HostFaction == null && pawn.RaceProps.Humanlike && pawn.Awake())
+                if (pawn.Faction is { IsPlayer: true } && pawn.HostFaction == null && pawn.RaceProps.Humanlike && pawn.Awake())
                 {
                     nothingHappeningCached = false;
                     break;
                 }
             }
 
-            if (nothingHappeningCached && map.IsPlayerHome && map.dangerWatcher.DangerRating >= StoryDanger.Low)
+            if (nothingHappeningCached && map.dangerWatcher?.DangerRating >= StoryDanger.Low)
                 nothingHappeningCached = false;
         }
 
