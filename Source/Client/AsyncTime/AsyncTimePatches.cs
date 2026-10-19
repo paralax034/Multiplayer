@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
+using System.Reflection.Emit;
 using HarmonyLib;
 using Multiplayer.Client.Factions;
 using RimWorld;
@@ -176,12 +177,22 @@ namespace Multiplayer.Client.AsyncTime
     {
         static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> insts)
         {
+            var pauseMethod = AccessTools.Method(typeof(TickManager), nameof(TickManager.Pause));
+            var pauseReplacement = AccessTools.Method(typeof(ReceiveLetterPause), nameof(PauseOnLetter));
+            var autoPauseGetter = AccessTools.PropertyGetter(typeof(Prefs), nameof(Prefs.AutomaticPauseMode));
+            var autoPauseReplacement = AccessTools.Method(typeof(ReceiveLetterPause), nameof(AutomaticPauseMode));
+
             foreach (var inst in insts)
             {
-                if (inst.operand as MethodInfo == AccessTools.PropertyGetter(typeof(Prefs), nameof(Prefs.AutomaticPauseMode)))
-                    inst.operand = AccessTools.Method(typeof(ReceiveLetterPause), nameof(AutomaticPauseMode));
-                else if (inst.operand as MethodInfo == AccessTools.Method(typeof(TickManager), nameof(TickManager.Pause)))
-                    inst.operand = AccessTools.Method(typeof(ReceiveLetterPause), nameof(PauseOnLetter));
+                if (inst.Calls(autoPauseGetter))
+                {
+                    inst.operand = autoPauseReplacement;
+                }
+                else if (inst.Calls(pauseMethod))
+                {
+                    yield return new CodeInstruction(OpCodes.Ldarg_1); // Letter let
+                    inst.operand = pauseReplacement;
+                }
 
                 yield return inst;
             }
@@ -194,7 +205,7 @@ namespace Multiplayer.Client.AsyncTime
                 : Prefs.AutomaticPauseMode;
         }
 
-        private static void PauseOnLetter(TickManager manager)
+        private static void PauseOnLetter(TickManager manager, Letter let)
         {
             if (Multiplayer.Client == null)
             {
@@ -202,9 +213,38 @@ namespace Multiplayer.Client.AsyncTime
                 return;
             }
 
+            Map targetMap = null;
+            if (let?.lookTargets?.targets != null)
+            {
+                var targets = let.lookTargets.targets;
+                for (int i = 0; i < targets.Count; i++)
+                {
+                    if (targets[i].Map != null)
+                    {
+                        targetMap = targets[i].Map;
+                        break;
+                    }
+                }
+            }
+
+            if (targetMap == null && let is ChoiceLetter choice && choice.quest != null)
+            {
+                var questTargets = choice.quest.QuestLookTargets;
+                foreach (var qt in questTargets)
+                {
+                    if (qt.HasWorldObject && qt.WorldObject is MapParent mp && mp.Map != null)
+                    {
+                        targetMap = mp.Map;
+                        break;
+                    }
+                }
+            }
+
+            targetMap ??= Multiplayer.MapContext;
+
             if (Multiplayer.GameComp.asyncTime)
             {
-                var tickable = (ITickable)Multiplayer.MapContext.AsyncTime() ?? Multiplayer.AsyncWorldTime;
+                ITickable tickable = (ITickable)targetMap?.AsyncTime() ?? Multiplayer.AsyncWorldTime;
                 tickable.DesiredTimeSpeed = TimeSpeed.Paused;
                 Multiplayer.GameComp.ResetAllTimeVotes(tickable.TickableId);
             }

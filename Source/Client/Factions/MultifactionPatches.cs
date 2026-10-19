@@ -750,29 +750,184 @@ static class LetterStackReceiveOnlyMyFaction
     }
 }
 
+public static class LetterSecurityUtility
+{
+    public static bool IsTargetForFaction(LookTargets lookTargets, Faction faction)
+    {
+        if (faction == null) return true;
+        if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction) return true;
+        if (lookTargets?.targets == null || lookTargets.targets.Count == 0) return true;
+
+        bool hasPlayerAffiliatedTarget = false;
+        var targets = lookTargets.targets;
+
+        for (int i = 0; i < targets.Count; i++)
+        {
+            var target = targets[i];
+            if (target.HasThing)
+            {
+                var thing = target.Thing;
+                if (thing.Faction is { IsPlayer: true } thingFac)
+                {
+                    if (thingFac == faction) return true;
+                    hasPlayerAffiliatedTarget = true;
+                }
+                else if (thing.Map?.ParentFaction is { IsPlayer: true } mapFac)
+                {
+                    if (mapFac == faction) return true;
+                    hasPlayerAffiliatedTarget = true;
+                }
+            }
+            else if (target.HasWorldObject)
+            {
+                var worldObj = target.WorldObject;
+                if (worldObj.Faction is { IsPlayer: true } worldFac)
+                {
+                    if (worldFac == faction) return true;
+                    hasPlayerAffiliatedTarget = true;
+                }
+            }
+            else if (target.Map?.ParentFaction is { IsPlayer: true } mapFac)
+            {
+                if (mapFac == faction) return true;
+                hasPlayerAffiliatedTarget = true;
+            }
+        }
+
+        return !hasPlayerAffiliatedTarget;
+    }
+
+    public static bool IsLetterForFaction(Letter let, Faction faction)
+    {
+        if (faction == null) return true;
+        if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction) return true;
+        if (let == null) return false;
+
+        if (let is ChoiceLetter choiceLetter && choiceLetter.quest != null)
+        {
+            if (choiceLetter.quest.TryGetPlayerFaction(out Faction questFaction))
+                return questFaction == faction;
+        }
+
+        if (let.lookTargets?.targets != null && let.lookTargets.targets.Count > 0)
+        {
+            return IsTargetForFaction(let.lookTargets, faction);
+        }
+
+        if (let.relatedFaction is { IsPlayer: true } relatedFac)
+        {
+            return relatedFac == faction;
+        }
+
+        return true;
+    }
+}
+
+[HarmonyPatch(typeof(LetterStack), nameof(LetterStack.LettersOnGUI))]
+static class LettersOnGUIFilterPatch
+{
+    private static readonly FieldInfo LettersField = AccessTools.Field(typeof(LetterStack), "letters");
+    private static readonly MethodInfo FilteredLettersMethod = AccessTools.Method(typeof(LettersOnGUIFilterPatch), nameof(GetFilteredLetters));
+
+    static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+    {
+        foreach (var ci in instructions)
+        {
+            if (ci.LoadsField(LettersField))
+            {
+                ci.opcode = OpCodes.Call;
+                ci.operand = FilteredLettersMethod;
+            }
+            yield return ci;
+        }
+    }
+
+    private static int lastFrameCached = -1;
+    private static readonly List<Letter> tmpFilteredLetters = new(32);
+
+    public static List<Letter> GetFilteredLetters(LetterStack stack)
+    {
+        if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction)
+            return stack.letters;
+
+        if (Time.frameCount != lastFrameCached)
+        {
+            lastFrameCached = Time.frameCount;
+            tmpFilteredLetters.Clear();
+            var myFaction = Multiplayer.RealPlayerFaction;
+            var allLetters = stack.letters;
+            for (int i = 0; i < allLetters.Count; i++)
+            {
+                var letter = allLetters[i];
+                if (LetterSecurityUtility.IsLetterForFaction(letter, myFaction))
+                {
+                    tmpFilteredLetters.Add(letter);
+                }
+            }
+        }
+
+        return tmpFilteredLetters;
+    }
+}
+
 [HarmonyPatch(typeof(LetterStack), nameof(LetterStack.ReceiveLetter), typeof(Letter), typeof(string), typeof(int), typeof(bool))]
 static class LetterStackReceiveSoundOnlyMyFaction
 {
-    private static MethodInfo PlayOneShotOnCamera =
-        typeof(SoundStarter).GetMethod(nameof(SoundStarter.PlayOneShotOnCamera));
+    private static readonly MethodInfo PlayOneShotOnCamera =
+        AccessTools.Method(typeof(SoundStarter), nameof(SoundStarter.PlayOneShotOnCamera), new[] { typeof(SoundDef), typeof(Map) });
+    private static readonly MethodInfo ReplacementMethod =
+        AccessTools.Method(typeof(LetterStackReceiveSoundOnlyMyFaction), nameof(PlaySoundReplacement));
 
     static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> insts)
     {
         foreach (var inst in insts)
         {
-            if (inst.operand as MethodInfo == PlayOneShotOnCamera)
-                yield return new CodeInstruction(
-                    OpCodes.Call,
-                    SymbolExtensions.GetMethodInfo((SoundDef s, Map m) => PlaySoundReplacement(s, m)));
+            if (inst.Calls(PlayOneShotOnCamera))
+            {
+                yield return new CodeInstruction(OpCodes.Ldarg_1); // Letter let
+                yield return new CodeInstruction(OpCodes.Call, ReplacementMethod);
+            }
             else
+            {
                 yield return inst;
+            }
         }
     }
 
-    static void PlaySoundReplacement(SoundDef sound, Map map)
+    static void PlaySoundReplacement(SoundDef sound, Map map, Letter let)
     {
-        if (Multiplayer.RealPlayerFaction == Faction.OfPlayer)
+        if (sound == null) return;
+        if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction)
+        {
             sound.PlayOneShotOnCamera(map);
+            return;
+        }
+
+        if (LetterSecurityUtility.IsLetterForFaction(let, Multiplayer.RealPlayerFaction))
+        {
+            sound.PlayOneShotOnCamera(map);
+        }
+    }
+}
+
+[HarmonyPatch(typeof(Messages), nameof(Messages.Message), typeof(Message), typeof(bool))]
+static class MessagesMessageFilterPatch
+{
+    static bool Prefix(Message msg, bool historical)
+    {
+        if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction)
+            return true;
+
+        if (!LetterSecurityUtility.IsTargetForFaction(msg.lookTargets, Multiplayer.RealPlayerFaction))
+        {
+            if (historical && Find.Archive != null)
+            {
+                Find.Archive.Add(msg);
+            }
+            return false;
+        }
+
+        return true;
     }
 }
 
