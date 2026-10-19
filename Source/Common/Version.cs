@@ -5,7 +5,7 @@ namespace Multiplayer.Common
 {
     public static class MpVersion
     {
-        public const string SimpleVersion = "0.11.5";
+        public const string SimpleVersion = "0.11.6";
         public const int Protocol = 56;
 
         public static readonly string? GitHash = Assembly.GetExecutingAssembly()

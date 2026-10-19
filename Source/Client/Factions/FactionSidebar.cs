@@ -19,7 +19,12 @@ namespace Multiplayer.Client
         private static string factionNameTextField;
         private static Color factionColor = new Color32(0x00, 0xBC, 0xD8, 255);
         private static bool setupNextMapFromTickZero;
-        private static ScenarioDef chosenScenario = ScenarioDefOf.Crashlanded;
+        private static ScenarioDef chosenScenarioInt;
+        private static ScenarioDef ChosenScenario
+        {
+            get => chosenScenarioInt ??= ScenarioDefOf.Crashlanded ?? DefDatabase<ScenarioDef>.GetNamedSilentFail("Crashlanded");
+            set => chosenScenarioInt = value;
+        }
 
         private static Vector2 joinFactionScroll;
 
@@ -110,7 +115,7 @@ namespace Multiplayer.Client
                         new ClientSetFactionPacket(Multiplayer.session.playerId, playerFaction.loadID));
                 }
 
-                Rect locateButton = new Rect(entryRect.xMax - 110, entryRect.y+7, 24, 24);
+                Rect locateButton = new Rect(entryRect.xMax - 110, entryRect.y + 7, 24, 24);
                 if (Widgets.ButtonImage(locateButton, TexButton.OpenInspector))
                 {
                     var factionHomes = Find.Maps.Where(m => m.ParentFaction == playerFaction).ToList();
@@ -242,7 +247,7 @@ namespace Multiplayer.Client
                 Find.WindowStack.Add(new Dialog_ChooseFactionColor(color =>
                 {
                     factionColor = color;
-                },factionColor));
+                }, factionColor));
             }
             viewRect.yMin += rowHeight + spacing;
             // END Faction Color Picker
@@ -310,7 +315,7 @@ namespace Multiplayer.Client
                 OpenScenarioChooser();
 
             Text.Anchor = TextAnchor.MiddleCenter;
-            Widgets.Label(scenarioRect, $"{chosenScenario?.label ?? Find.Scenario.name}");
+            Widgets.Label(scenarioRect, $"{ChosenScenario?.label ?? Find.Scenario.name}");
             Text.Anchor = TextAnchor.UpperLeft;
 
             viewRect.yMin += rowHeight + spacing;
@@ -379,16 +384,32 @@ namespace Multiplayer.Client
             try
             {
                 if (Current.Game.InitData?.startingAndOptionalPawns is { } pawns)
+                {
+                    if (Find.GameInitData != null)
+                        Find.GameInitData.playerFaction = null;
+
+                    var safeWorldIdeo = Find.IdeoManager?.IdeosListForReading?.Count > 0
+                        ? Find.IdeoManager.IdeosListForReading[0]
+                        : null;
+
                     for (int i = 0; i < Find.GameInitData.startingPawnCount; i++)
                     {
-                        FactionCreator.SendPawn(playerId, pawns[i]);
-                        startingPawns.Add(pawns[i]);
+                        var p = pawns[i];
+                        if (p.ideo != null && safeWorldIdeo != null)
+                        {
+                            p.ideo.SetIdeo(safeWorldIdeo);
+                            p.ideo.previousIdeos?.Clear();
+                            p.ideo.babyIdeoExposure?.Clear();
+                        }
+                        FactionCreator.SendPawn(playerId, p);
+                        startingPawns.Add(p);
                     }
+                }
 
                 factionCreationDto.factionName = factionNameTextField;
                 factionCreationDto.factionColor = factionColor;
                 factionCreationDto.startingTile = Find.WorldInterface.SelectedTile;
-                factionCreationDto.scenarioDef = chosenScenario;
+                factionCreationDto.scenarioDef = ChosenScenario;
                 factionCreationDto.chooseIdeoInfo = chooseIdeoInfo;
                 factionCreationDto.generateMap = generateMap;
                 factionCreationDto.startingPossessions = GetStartingPossessions(startingPawns);
@@ -406,13 +427,13 @@ namespace Multiplayer.Client
         {
             Find.WindowStack.Add(new Page_SelectScenario_Multifaction
             {
-                curScen = chosenScenario?.scenario,
+                curScen = ChosenScenario?.scenario,
                 onScenChosen = chosenScen =>
                 {
                     var selectedDef = DefDatabase<ScenarioDef>.AllDefsListForReading.Find(def => def.scenario == chosenScen);
 
                     if (selectedDef != null)
-                        chosenScenario = selectedDef;
+                        ChosenScenario = selectedDef;
                 }
             });
         }
@@ -444,7 +465,7 @@ namespace Multiplayer.Client
         }
         private static void InitializeDataForGameConfigurationPages()
         {
-            Current.Game.Scenario = chosenScenario.scenario;
+            Current.Game.Scenario = ChosenScenario.scenario;
 
             Current.Game.InitData = new GameInitData
             {

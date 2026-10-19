@@ -61,8 +61,21 @@ public static class FactionCreator
             if (creationData.generateMap)
                 using (MpScope.PushFaction(newFaction))
                 {
-                    foreach (var pawn in StartingPawnUtility.StartingAndOptionalPawns)
-                        pawn.ideo.SetIdeo(newFaction.ideos.PrimaryIdeo);
+                    var startingPawns = Find.GameInitData?.startingAndOptionalPawns;
+                    if (startingPawns != null)
+                    {
+                        var targetIdeo = newFaction.ideos?.PrimaryIdeo;
+                        for (int i = 0; i < startingPawns.Count; i++)
+                        {
+                            var p = startingPawns[i];
+                            if (p.ideo != null && targetIdeo != null)
+                            {
+                                p.ideo.SetIdeo(targetIdeo);
+                                p.ideo.previousIdeos?.Clear();
+                                p.ideo.babyIdeoExposure?.Clear();
+                            }
+                        }
+                    }
 
                     newMap = GenerateNewMap(creationData.startingTile, scenario, creationData.setupNextMapFromTickZero);
                 }

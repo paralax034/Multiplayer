@@ -43,23 +43,36 @@ namespace Multiplayer.Client
         public static bool Simulating => simulating?.target != null;
         public static bool Frozen => serverFrozen && Timer >= frozenAt && !Simulating && ShouldHandle;
 
-        public static IEnumerable<ITickable> AllTickables
-        {
-            get
-            {
-                yield return Multiplayer.AsyncWorldTime;
+        private static readonly List<ITickable> TickablesBuffer = new(8);
 
-                var maps = Find.Maps;
-                for (int i = maps.Count - 1; i >= 0; i--)
-                    yield return maps[i].AsyncTime();
-            }
-        }
+        public static IEnumerable<ITickable> AllTickables => GetTickables();
 
         static Stopwatch updateTimer = Stopwatch.StartNew();
         public static Stopwatch tickTimer = Stopwatch.StartNew();
 
         [TweakValue("Multiplayer")]
         public static bool doSimulate = true;
+
+        public static List<ITickable> GetTickables()
+        {
+            TickablesBuffer.Clear();
+
+            if (Multiplayer.AsyncWorldTime != null)
+                TickablesBuffer.Add(Multiplayer.AsyncWorldTime);
+
+            var maps = Find.Maps;
+            if (maps != null)
+            {
+                for (int i = maps.Count - 1; i >= 0; i--)
+                {
+                    var asyncTime = maps[i].AsyncTime();
+                    if (asyncTime != null)
+                        TickablesBuffer.Add(asyncTime);
+                }
+            }
+
+            return TickablesBuffer;
+        }
 
         static bool Prefix()
         {
@@ -93,7 +106,7 @@ namespace Multiplayer.Client
             if (realTime > 0)
                 realTime = 0;
 
-            if (Time.time - frameTimeSentAt > 32f/1000f)
+            if (Time.time - frameTimeSentAt > 32f / 1000f)
             {
                 Multiplayer.Client.Send(new ClientFrameTimePacket(avgFrameTime));
                 frameTimeSentAt = Time.time;
@@ -111,7 +124,7 @@ namespace Multiplayer.Client
                 SimpleProfiler.Start();
 
             RunCmds();
-            if  (LongEventHandler.eventQueue.Count == 0)
+            if (LongEventHandler.eventQueue.Count == 0)
             {
                 DoUpdate(out var worked);
                 if (worked) workTicks++;
@@ -168,9 +181,11 @@ namespace Multiplayer.Client
         private static bool RunCmds()
         {
             int curTimer = Timer;
+            var tickables = GetTickables();
 
-            foreach (ITickable tickable in AllTickables)
+            for (int i = 0; i < tickables.Count; i++)
             {
+                var tickable = tickables[i];
                 while (tickable.Cmds.Count > 0 && tickable.Cmds.Peek().ticks == curTimer)
                 {
                     ScheduledCommand cmd = tickable.Cmds.Dequeue();
@@ -181,9 +196,13 @@ namespace Multiplayer.Client
                     if (target == null)
                     {
                         Log.Error($"!!! Tickable of {cmd.mapId} not found! {cmd}");
-                    } else target.ExecuteCmd(cmd);
+                    }
+                    else
+                    {
+                        target.ExecuteCmd(cmd);
+                    }
 
-                    if (LongEventHandler.eventQueue.Count > 0) return true; // Yield to e.g. join-point creation
+                    if (LongEventHandler.eventQueue.Count > 0) return true;
                 }
             }
 
@@ -217,10 +236,12 @@ namespace Multiplayer.Client
         public static bool DoTick(ref bool worked)
         {
             tickTimer.Restart();
+            var tickables = GetTickables();
 
-            foreach (ITickable tickable in AllTickables)
+            for (int i = 0; i < tickables.Count; i++)
             {
-                if (tickable.TimePerTick(tickable.DesiredTimeSpeed) == 0) continue;
+                var tickable = tickables[i];
+                if (tickable.TimePerTick(tickable.DesiredTimeSpeed) == 0f) continue;
                 tickable.TimeToTickThrough += 1f;
 
                 worked = true;
@@ -314,7 +335,16 @@ namespace Multiplayer.Client
 
         public static void SetTimer(int value) => Timer = value;
 
-        public static ITickable TickableById(int tickableId) => AllTickables.FirstOrDefault(t => t.TickableId == tickableId);
+        public static ITickable TickableById(int tickableId)
+        {
+            var tickables = GetTickables();
+            for (int i = 0; i < tickables.Count; i++)
+            {
+                if (tickables[i].TickableId == tickableId)
+                    return tickables[i];
+            }
+            return null;
+        }
     }
 
     public class SimulatingData
