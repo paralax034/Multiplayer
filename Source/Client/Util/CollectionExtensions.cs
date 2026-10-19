@@ -21,7 +21,7 @@ namespace Multiplayer.Client
 
         public static void RemoveNulls(this IList list)
         {
-            for (int i = list.Count - 1; i > 0; i--)
+            for (int i = list.Count - 1; i >= 0; i--)
             {
                 if (list[i] == null)
                     list.RemoveAt(i);

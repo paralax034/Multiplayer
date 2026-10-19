@@ -1,177 +1,180 @@
-using HarmonyLib;
-using RimWorld;
+using System;
 using System.Collections.Generic;
-using System.Linq;
 using System.Reflection;
 using System.Reflection.Emit;
+using HarmonyLib;
+using RimWorld;
 using Verse;
+using Verse.AI;
 
-#if false
 namespace Multiplayer.Client.Patches
 {
-    //This is a full patch to replace all the Multithreading race calls in work threads
-    internal class PathFinderPatch
+    internal static class PathFinderPatch
     {
-        // PathGridDoorsBlockedJob is a cross-tick Unity Job: scheduled at end of MapPreTick(N),
-        // completes at start of MapPreTick(N+1). During MapTick(N) it runs concurrently on a
-        // worker thread and reads live pawn.Position while the main thread writes
-        // pawn.Position = nextCell in Pawn_PathFollower.PatherTick(). Host and client see
-        // different enemy positions depending on thread scheduling → different blocked cells →
-        // different A* path → different nextCell for the pathing pawn → WillCollideNextCell
-        // differs → one client enters the attack branch → ChooseMeleeVerb → Rand.Chance → desync.
-        //
-        // Fix: snapshot all cached pawn positions on the main thread right after
-        // ScheduleBatchedPathJobs (still inside MapPreTick, before any pawn ticking).
-        // Worker threads reading pawn.Position during Execute() get the stable snapshot.
-
-        // There are extra datas needed about jobs
-        // Related line
-        // bool collideWithNonHostile = this.pawn.CurJob != null && (this.pawn.CurJob.collideWithPawns
-        //  || this.pawn.CurJob.def.collideWithPawns || this.pawn.jobs.curDriver.collideWithPawns);
-        // Rebuild necessary data too
-        class PawnSnapShot(Pawn pawn)
+        private sealed class PawnSnapShot
         {
-            public IntVec3 Position = pawn.Position;
-            public bool CollideWithNonHostile = GetCollideWithNoneHostile(pawn);
-            public bool ShouldCollideWithPawns = PawnUtility.ShouldCollideWithPawns(pawn);
-            public static bool GetCollideWithNoneHostile(Pawn pawn)
+            public readonly IntVec3 Position;
+            public readonly bool ShouldCollideWithPawns;
+            public readonly bool CollideWithNonHostile;
+
+            public PawnSnapShot(Pawn pawn)
             {
-                return pawn.CurJob != null && (pawn.CurJob.collideWithPawns
-                        || pawn.CurJob.def.collideWithPawns || pawn.jobs.curDriver.collideWithPawns);
+                Position = pawn.Position;
+                ShouldCollideWithPawns = PawnUtility.ShouldCollideWithPawns(pawn);
+                CollideWithNonHostile = pawn.CurJob != null && (pawn.CurJob.collideWithPawns
+                    || pawn.CurJob.def.collideWithPawns || pawn.jobs?.curDriver?.collideWithPawns == true);
             }
         }
 
-
-        static class PawnPositionSnapshot
+        private static class PawnPositionSnapshot
         {
-            // Written once per tick on the main thread before jobs are dispatched;
-            // read concurrently by worker threads. Dictionary is safe for concurrent reads.
-            static readonly Dictionary<Pawn, PawnSnapShot> snapshotDict = [];
+            private static readonly Dictionary<Pawn, PawnSnapShot> SnapshotDict = new();
 
             public static void Rebuild(IReadOnlyList<Pawn> pawns)
             {
-                snapshotDict.Clear();
-                foreach (var pawn in pawns)
-                    snapshotDict[pawn] = new PawnSnapShot(pawn);
+                SnapshotDict.Clear();
+                if (pawns == null) return;
+
+                for (int i = 0; i < pawns.Count; i++)
+                {
+                    Pawn pawn = pawns[i];
+                    if (pawn != null && pawn.Spawned)
+                    {
+                        SnapshotDict[pawn] = new PawnSnapShot(pawn);
+                    }
+                }
             }
 
             public static bool TryGet(Pawn pawn, out PawnSnapShot snapshot) =>
-                snapshotDict.TryGetValue(pawn, out snapshot);
+                SnapshotDict.TryGetValue(pawn, out snapshot);
         }
 
         [HarmonyPatch(typeof(PathFinder), "ScheduleBatchedPathJobs")]
-        static class ScheduleBatchedPathJobsSnapshotPositions
+        private static class ScheduleBatchedPathJobsSnapshotPositions
         {
-            static readonly FieldInfo CachedPawns =
+            private static readonly MethodInfo EnsureCachedMethod =
+                AccessTools.Method(typeof(PathFinder), "EnsureDoorsPawnsCached");
+            private static readonly FieldInfo CachedPawnsField =
                 AccessTools.Field(typeof(PathFinder), "cachedPawns");
 
-            static void Prefix(PathFinder __instance)
+            private static void Prefix(PathFinder __instance)
             {
                 if (Multiplayer.Client == null) return;
-                // Snapshot pawn positions immediately before PathGridDoorsBlockedJob is
-                // dispatched so worker threads read stable positions instead of live ones.
-                PawnPositionSnapshot.Rebuild((IReadOnlyList<Pawn>)CachedPawns.GetValue(__instance));
+
+                EnsureCachedMethod?.Invoke(__instance, null);
+                var cachedPawns = (IReadOnlyList<Pawn>)CachedPawnsField.GetValue(__instance);
+                PawnPositionSnapshot.Rebuild(cachedPawns);
             }
         }
 
         [HarmonyPatch]
-        static class PathGridDoorsBlockedJobPositionPatch
+        private static class PathGridDoorsBlockedJobPositionPatch
         {
-            static readonly MethodInfo PositionGetter =
+            private static readonly MethodInfo PositionGetter =
                 AccessTools.PropertyGetter(typeof(Thing), nameof(Thing.Position));
+            private static readonly MethodInfo ReplacementPositionGetter =
+                AccessTools.Method(typeof(PathGridDoorsBlockedJobPositionPatch), nameof(GetPosition));
 
-            static IEnumerable<MethodBase> TargetMethods()
+            private static IEnumerable<MethodBase> TargetMethods()
             {
-                yield return AccessTools.Method(typeof(PathGridDoorsBlockedJob), "Execute");
+                yield return AccessTools.Method(typeof(PathGridDoorsBlockedJob), nameof(PathGridDoorsBlockedJob.Execute));
                 yield return AccessTools.Method(typeof(PathGridDoorsBlockedJob), "CanBlockEver");
             }
 
-            static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> insts)
+            private static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
             {
-                foreach (var inst in insts)
+                foreach (var inst in instructions)
                 {
                     if (inst.Calls(PositionGetter))
-                        inst.operand = AccessTools.Method(
-                            typeof(PathGridDoorsBlockedJobPositionPatch), nameof(GetPosition));
+                    {
+                        inst.opcode = OpCodes.Call;
+                        inst.operand = ReplacementPositionGetter;
+                    }
                     yield return inst;
                 }
             }
 
             internal static IntVec3 GetPosition(Pawn pawn)
             {
-                if (Multiplayer.Client != null
-                    && PawnPositionSnapshot.TryGet(pawn, out PawnSnapShot snapshot))
+                if (Multiplayer.Client != null && PawnPositionSnapshot.TryGet(pawn, out PawnSnapShot snapshot))
                     return snapshot.Position;
+
                 return pawn.Position;
             }
         }
+
         [HarmonyPatch]
-        static class PathGridDoorsBlockedJobCollideWithNonHostilePatch
+        private static class PathGridDoorsBlockedJobPawnBlockedByPatch
         {
-            //ShouldCollideWithPawns
-            static readonly MethodInfo MethodShouldCollideWithPawns = AccessTools.Method(typeof(PawnUtility), nameof(PawnUtility.ShouldCollideWithPawns));
-            static MethodInfo MethodShouldCollideWithPawnsGetter = AccessTools.Method(typeof(PawnUtility), nameof(PawnUtility.ShouldCollideWithPawns));
-            //CollideWithNonHostile
-            static readonly MethodInfo MethodCanBlockEver =
-                AccessTools.Method(typeof(PathGridDoorsBlockedJob), nameof(PathGridDoorsBlockedJob.CanBlockEver));
-            static readonly FieldInfo FieldPawn =
-                AccessTools.Field(typeof(PathGridDoorsBlockedJob), nameof(PathGridDoorsBlockedJob.pawn));
-            static readonly MethodInfo MethodGetCollideWithNonHostile =
-                AccessTools.Method(typeof(PathGridDoorsBlockedJobCollideWithNonHostilePatch), nameof(GetCollideWithNonHostile));
-            static IEnumerable<MethodBase> TargetMethods()
+            private static readonly MethodInfo TargetPawnBlockedBy =
+                AccessTools.Method(typeof(PawnUtility), nameof(PawnUtility.PawnBlockedBy));
+            private static readonly MethodInfo ReplacementPawnBlockedBy =
+                AccessTools.Method(typeof(PathGridDoorsBlockedJobPawnBlockedByPatch), nameof(PawnBlockedBySnapshotAware));
+
+            private static readonly MethodInfo TargetShouldCollide =
+                AccessTools.Method(typeof(PawnUtility), nameof(PawnUtility.ShouldCollideWithPawns));
+            private static readonly MethodInfo ReplacementShouldCollide =
+                AccessTools.Method(typeof(PathGridDoorsBlockedJobPawnBlockedByPatch), nameof(GetShouldCollideWithPawns));
+
+            private static IEnumerable<MethodBase> TargetMethods()
             {
-                yield return AccessTools.Method(typeof(PathGridDoorsBlockedJob), "Execute");
+                yield return AccessTools.Method(typeof(PathGridDoorsBlockedJob), nameof(PathGridDoorsBlockedJob.Execute));
+                yield return AccessTools.Method(typeof(PathGridDoorsBlockedJob), "CanBlockEver");
             }
-            // start
-            // calls to ShouldCollideWithPawns, replace with cached one
-            // calls to CanBlockEver
-            // ldarg.0
-            // skip all and set result of V_13(collideWithNonHostile) here
-            // stloc.s V_13
-            static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> e, MethodBase original)
+
+            private static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
             {
-                List<CodeInstruction> insts = e.ToList();
-                // ShouldCollideWithPawns
+                foreach (var inst in instructions)
                 {
-                    foreach (var inst in insts)
-                        if (inst.Calls(MethodShouldCollideWithPawns))
-                            inst.operand = MethodShouldCollideWithPawnsGetter;
+                    if (inst.Calls(TargetPawnBlockedBy))
+                    {
+                        inst.opcode = OpCodes.Call;
+                        inst.operand = ReplacementPawnBlockedBy;
+                    }
+                    else if (inst.Calls(TargetShouldCollide))
+                    {
+                        inst.opcode = OpCodes.Call;
+                        inst.operand = ReplacementShouldCollide;
+                    }
+                    yield return inst;
                 }
-                // CollideWithNonHostile
-                {
-                    var finder = new CodeFinder(original, insts);
-
-                    int start = finder.Forward(OpCodes.Call, MethodCanBlockEver)
-                        .Forward(OpCodes.Ldarg_0);
-                    int end = finder.Forward(OpCodes.Stloc_S, 13);
-
-                    insts.RemoveRange(start, end - start);
-                    insts.Insert(start,
-                        new CodeInstruction(OpCodes.Ldarg_0),
-                        new CodeInstruction(OpCodes.Ldfld, FieldPawn),
-                        new CodeInstruction(OpCodes.Call, MethodGetCollideWithNonHostile)
-                        );
-                }
-
-                return insts;
             }
 
             internal static bool GetShouldCollideWithPawns(Pawn pawn)
             {
-                if (Multiplayer.Client != null
-                    && PawnPositionSnapshot.TryGet(pawn, out PawnSnapShot snapshot))
+                if (Multiplayer.Client != null && PawnPositionSnapshot.TryGet(pawn, out PawnSnapShot snapshot))
                     return snapshot.ShouldCollideWithPawns;
+
                 return PawnUtility.ShouldCollideWithPawns(pawn);
             }
-            internal static bool GetCollideWithNonHostile(Pawn pawn)
-            {
-                if (Multiplayer.Client != null
-                    && PawnPositionSnapshot.TryGet(pawn, out PawnSnapShot snapshot))
-                    return snapshot.CollideWithNonHostile;
 
-                return PawnSnapShot.GetCollideWithNoneHostile(pawn);
+            internal static bool PawnBlockedBySnapshotAware(Pawn forPawn, Pawn other, bool collideOnlyWithStandingPawns, bool collideWithNonHostile, bool forPathFinder, bool useId)
+            {
+                if (Multiplayer.Client != null && PawnPositionSnapshot.TryGet(other, out PawnSnapShot snapshot))
+                {
+                    if (!snapshot.ShouldCollideWithPawns)
+                        return false;
+
+                    if (other == forPawn)
+                        return false;
+
+                    if (PawnUtility.PawnsCanShareCellBecauseOfBodySize(other, forPawn))
+                        return false;
+
+                    if (other.IsPsychologicallyInvisible() || !other.kindDef.collidesWithPawns)
+                        return false;
+
+                    if (other.HostileTo(forPawn))
+                        return true;
+
+                    if (collideWithNonHostile)
+                        return snapshot.CollideWithNonHostile;
+
+                    return false;
+                }
+
+                return PawnUtility.PawnBlockedBy(forPawn, other, collideOnlyWithStandingPawns, collideWithNonHostile, forPathFinder, useId);
             }
         }
     }
 }
-#endif
