@@ -1,5 +1,6 @@
 ﻿using HarmonyLib;
 using Multiplayer.Client.Saving;
+using Multiplayer.Common;
 using Verse;
 using Verse.Profile;
 
@@ -7,7 +8,7 @@ namespace Multiplayer.Client
 {
     [HarmonyPatch(typeof(SavedGameLoaderNow))]
     [HarmonyPatch(nameof(SavedGameLoaderNow.LoadGameFromSaveFileNow))]
-    [HarmonyPatch(new[] { typeof(string) })]
+    [HarmonyPatch([typeof(string)])]
     public static class LoadPatch
     {
         public static TempGameData gameToLoad;
@@ -44,9 +45,22 @@ namespace Multiplayer.Client
             {
                 LongEventHandler.ExecuteWhenFinished(() =>
                 {
-                    // Inits all caches
-                    foreach (ITickable tickable in TickPatch.AllTickables)
-                        tickable.Tick();
+                    // Update dirty map grids and room structures safely without executing a simulation tick
+                    foreach (var map in Find.Maps)
+                    {
+                        var asyncTime = map.AsyncTime();
+                        asyncTime?.UpdateManagers();
+
+                        if (MpVersion.IsDebug && asyncTime != null)
+                        {
+                            Log.Message($"Loaded Map {map.uniqueID}: mapTicks={asyncTime.mapTicks}, randState=0x{asyncTime.randState:X16}, cmds={asyncTime.cmds.Count}, Timer={TickPatch.Timer}");
+                        }
+                    }
+
+                    if (MpVersion.IsDebug && Multiplayer.AsyncWorldTime != null)
+                    {
+                        Log.Message($"Loaded World: worldTicks={Multiplayer.AsyncWorldTime.worldTicks}, randState=0x{Multiplayer.AsyncWorldTime.randState:X16}, Timer={TickPatch.Timer}");
+                    }
 
                     if (!Current.Game.Maps.Any())
                     {

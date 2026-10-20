@@ -44,7 +44,22 @@ namespace Multiplayer.Client
                      select (map1, map2))
             {
                 if (!g.map1.randomStates.SequenceEqual(g.map2.randomStates))
-                    return $"Wrong random state on map {g.map1.mapId}";
+                {
+                    int firstDiff = -1;
+                    int minLen = Math.Min(g.map1.randomStates.Count, g.map2.randomStates.Count);
+                    for (int i = 0; i < minLen; i++)
+                    {
+                        if (g.map1.randomStates[i] != g.map2.randomStates[i])
+                        {
+                            firstDiff = i;
+                            break;
+                        }
+                    }
+                    if (firstDiff == -1 && g.map1.randomStates.Count != g.map2.randomStates.Count)
+                        firstDiff = minLen;
+
+                    return $"Wrong random state on map {g.map1.mapId} (LocalStates: {g.map1.randomStates.Count}, RemoteStates: {g.map2.randomStates.Count}, FirstDiffIdx: {firstDiff})";
+                }
             }
 
             if (!worldRandomStates.SequenceEqual(other.worldRandomStates))
@@ -94,7 +109,7 @@ namespace Multiplayer.Client
             commandRandomStates = sync.commandRandomStates,
             worldRandomStates = sync.worldRandomStates,
             mapStates = sync.mapRandomStates.Select(state => new MapRandomStateData(state.mapId)
-                { randomStates = state.randomStates }).ToList(),
+            { randomStates = state.randomStates }).ToList(),
             desyncStackTraceHashes = sync.traceHashes,
             simulating = sync.simulating,
             roundMode = sync.roundMode
@@ -106,7 +121,7 @@ namespace Multiplayer.Client
             commandRandomStates = commandRandomStates,
             worldRandomStates = worldRandomStates,
             mapRandomStates = mapStates.Select(state => new MapRandomState
-                { mapId = state.mapId, randomStates = state.randomStates }).ToList(),
+            { mapId = state.mapId, randomStates = state.randomStates }).ToList(),
             traceHashes = desyncStackTraceHashes,
             simulating = simulating,
             roundMode = roundMode

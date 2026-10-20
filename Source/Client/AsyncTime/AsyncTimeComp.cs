@@ -31,23 +31,15 @@ namespace Multiplayer.Client
             if (mapTicks < slower.forceNormalSpeedUntil)
                 return speed == TimeSpeed.Paused ? 0 : 1;
 
-            switch (speed)
+            return speed switch
             {
-                case TimeSpeed.Paused:
-                    return 0f;
-                case TimeSpeed.Normal:
-                    return 1f;
-                case TimeSpeed.Fast:
-                    return 3f;
-                case TimeSpeed.Superfast:
-                    if (nothingHappeningCached)
-                        return 12f;
-                    return 6f;
-                case TimeSpeed.Ultrafast:
-                    return 15f;
-                default:
-                    return -1f;
-            }
+                TimeSpeed.Paused => 0f,
+                TimeSpeed.Normal => 1f,
+                TimeSpeed.Fast => 3f,
+                TimeSpeed.Superfast => 6f,
+                TimeSpeed.Ultrafast => 15f,
+                _ => -1f,
+            };
         }
 
         public TimeSpeed DesiredTimeSpeed
@@ -101,7 +93,7 @@ namespace Multiplayer.Client
         public AsyncTimeComp(Map map, int gameStartAbsTick = 0)
         {
             this.map = map;
-            this.gameStartAbsTickMap = gameStartAbsTick;
+            gameStartAbsTickMap = gameStartAbsTick;
 
             // Use the world's constant rand seed and map tile ID as our initial randState.
             // Only fill the seed part, leave the iterations out.
@@ -142,7 +134,6 @@ namespace Multiplayer.Client
                 Find.TickManager.ticksThisFrame = 0;
 
                 UpdateManagers();
-                CacheNothingHappening();
             }
             finally
             {
@@ -441,38 +432,6 @@ namespace Multiplayer.Client
             {
                 RestoreState();
             }
-        }
-
-        private bool nothingHappeningCached;
-        private const int NothingHappeningCheckIntervalTicks = 30;
-
-        private void CacheNothingHappening()
-        {
-            // Only relevant on Superfast speed to decide between 6x and 12x multiplier.
-            // Avoid expensive pawn iteration during pause, normal speed, or catch-up simulation.
-            if (timeSpeedInt != TimeSpeed.Superfast || TickPatch.Simulating)
-                return;
-
-            // Check at most once every 30 ticks instead of every single tick
-            if (mapTicks % NothingHappeningCheckIntervalTicks != 0)
-                return;
-
-            nothingHappeningCached = true;
-            var list = map.mapPawns.AllPawnsSpawned;
-
-            // Check all player-owned humanlikes on map regardless of specific player faction (multifaction safe)
-            for (int i = 0; i < list.Count; i++)
-            {
-                var pawn = list[i];
-                if (pawn.Faction is { IsPlayer: true } && pawn.HostFaction == null && pawn.RaceProps.Humanlike && pawn.Awake())
-                {
-                    nothingHappeningCached = false;
-                    break;
-                }
-            }
-
-            if (nothingHappeningCached && map.dangerWatcher?.DangerRating >= StoryDanger.Low)
-                nothingHappeningCached = false;
         }
 
         public override string ToString()

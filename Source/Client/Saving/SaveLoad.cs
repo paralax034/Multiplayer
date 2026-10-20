@@ -206,7 +206,14 @@ namespace Multiplayer.Client
                 int id = int.Parse(mapNode["uniqueID"].InnerText);
                 byte[] mapData = ScribeUtil.XmlToByteArray(mapNode);
                 mapDataDict[id] = mapData;
-                mapCmdsDict[id] = new List<ScheduledCommand>(Find.Maps.First(m => m.uniqueID == id).AsyncTime().cmds);
+                var map = Find.Maps.First(m => m.uniqueID == id);
+                var asyncTime = map.AsyncTime();
+                mapCmdsDict[id] = [.. asyncTime.cmds];
+
+                if (MpVersion.IsDebug)
+                {
+                    Log.Message($"Snapshot Map {id}: mapTicks={asyncTime.mapTicks}, randState=0x{asyncTime.randState:X16}, cmds={asyncTime.cmds.Count}, Timer={TickPatch.Timer}");
+                }
             }
 
             if (removeCurrentMapId)
@@ -215,7 +222,12 @@ namespace Multiplayer.Client
             mapsNode.RemoveAll();
 
             byte[] gameData = ScribeUtil.XmlToByteArray(data.SaveData);
-            mapCmdsDict[ScheduledCommand.Global] = new List<ScheduledCommand>(Multiplayer.AsyncWorldTime.cmds);
+            mapCmdsDict[ScheduledCommand.Global] = [.. Multiplayer.AsyncWorldTime.cmds];
+
+            if (MpVersion.IsDebug)
+            {
+                Log.Message($"Snapshot World: worldTicks={Multiplayer.AsyncWorldTime.worldTicks}, randState=0x{Multiplayer.AsyncWorldTime.randState:X16}, globalCmds={Multiplayer.AsyncWorldTime.cmds.Count}, Timer={TickPatch.Timer}");
+            }
 
             return new GameDataSnapshot(
                 TickPatch.Timer,
@@ -249,7 +261,8 @@ namespace Multiplayer.Client
                 byte[] data = writer.ToArray();
 
                 OnMainThread.Enqueue(() => Multiplayer.Client?.SendFragmented(Packets.Client_WorldDataUpload, data));
-            };
+            }
+            ;
 
             if (async)
                 ThreadPool.QueueUserWorkItem(c => Send());

@@ -135,13 +135,18 @@ namespace Multiplayer.Client
         public void ScheduleCommand(ScheduledCommand cmd)
         {
             MpLog.Debug(cmd.ToString());
-            dataSnapshot.MapCmds.GetOrAddNew(cmd.mapId).Add(cmd);
+
+            // Route commands to the correct snapshot buffer during loading.
+            // If consistentCommandOrder is active, the snapshot must store them under ScheduledCommand.Global
+            // so AsyncWorldTimeComp.FinalizeInit() can retrieve them later.
+            int targetQueueId = (cmd.mapId == ScheduledCommand.Global || consistentCommandOrder) ? ScheduledCommand.Global : cmd.mapId;
+            dataSnapshot.MapCmds.GetOrAddNew(targetQueueId).Add(cmd);
 
             if (Current.ProgramState != ProgramState.Playing) return;
 
             // Minimal code impact fix for #733. Having all the commands be added to a single queue gets rid of the
             // out-of-order execution problem.
-            if (cmd.mapId == ScheduledCommand.Global || consistentCommandOrder)
+            if (targetQueueId == ScheduledCommand.Global)
                 Multiplayer.AsyncWorldTime.Cmds.Enqueue(cmd);
             else
                 cmd.GetMap()?.AsyncTime().Cmds.Enqueue(cmd);

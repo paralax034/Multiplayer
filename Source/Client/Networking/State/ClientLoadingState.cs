@@ -79,7 +79,7 @@ public class ClientLoadingState(ConnectionBase connection) : ClientBaseState(con
 
         var mapCmdsDict = new Dictionary<int, List<ScheduledCommand>>();
         var mapDataDict = new Dictionary<int, byte[]>();
-        List<int> mapsToLoad = new List<int>();
+        List<int> mapsToLoad = [];
 
         int mapCmdsCount = data.ReadInt32();
         for (int i = 0; i < mapCmdsCount; i++)
@@ -87,7 +87,7 @@ public class ClientLoadingState(ConnectionBase connection) : ClientBaseState(con
             int mapId = data.ReadInt32();
 
             int mapCmdsLen = data.ReadInt32();
-            List<ScheduledCommand> mapCmds = new List<ScheduledCommand>(mapCmdsLen);
+            List<ScheduledCommand> mapCmds = new(mapCmdsLen);
             for (int j = 0; j < mapCmdsLen; j++)
                 mapCmds.Add(ScheduledCommand.Deserialize(new ByteReader(data.ReadPrefixedBytes())));
 
@@ -127,9 +127,21 @@ public class ClientLoadingState(ConnectionBase connection) : ClientBaseState(con
             ? $"Initial sync opinions: {initialOpinions.First().startTick}...{initialOpinions.Last().startTick}"
             : "No initial sync opinions");
 
+        if (MpVersion.IsDebug)
+        {
+            Log.Message($"Catch-Up plan: CurrentTimer={TickPatch.Timer}, SimulatingTo={tickUntil}, PendingMapQueues={mapCmdsDict.Count}");
+        }
+
         TickPatch.SetSimulation(
             toTickUntil: true,
-            onFinish: () => Multiplayer.Client.Send(Packets.Client_WorldReady),
+            onFinish: () =>
+            {
+                if (MpVersion.IsDebug)
+                {
+                    Log.Message($"Catch-Up finished at Timer={TickPatch.Timer}. Sending Client_WorldReady.");
+                }
+                Multiplayer.Client.Send(Packets.Client_WorldReady);
+            },
             cancelButtonKey: "Quit",
             onCancel: GenScene.GoToMainMenu // Calls StopMultiplayer through a patch
         );

@@ -91,7 +91,8 @@ namespace Multiplayer.Client
 
             if (desyncMessage != null)
             {
-                MpLog.Log($"Desynced after last valid tick {lastValidTick}: {desyncMessage}");
+                var mapTicksInfo = Multiplayer.game?.asyncTimeComps?.Select(c => $"Map {c.map.uniqueID}: mapTicks={c.mapTicks}").Join(", ") ?? "no maps";
+                MpLog.Log($"Desynced after last valid tick {lastValidTick}: {desyncMessage} | Local {mapTicksInfo}");
                 Multiplayer.session.desynced = true;
                 TickPatch.ClearSimulating();
                 OnMainThread.Enqueue(() => HandleDesync(oldOpinion, newOpinion, desyncMessage));
@@ -163,7 +164,7 @@ namespace Multiplayer.Client
         {
             if (!ShouldCollect) return;
             OpinionInBuilding.TryMarkSimulating();
-            OpinionInBuilding.commandRandomStates.Add((uint) (state >> 32));
+            OpinionInBuilding.commandRandomStates.Add((uint)(state >> 32));
         }
 
         /// <summary>
@@ -174,7 +175,7 @@ namespace Multiplayer.Client
         {
             if (!ShouldCollect) return;
             OpinionInBuilding.TryMarkSimulating();
-            OpinionInBuilding.worldRandomStates.Add((uint) (state >> 32));
+            OpinionInBuilding.worldRandomStates.Add((uint)(state >> 32));
         }
 
         /// <summary>
@@ -186,7 +187,7 @@ namespace Multiplayer.Client
         {
             if (!ShouldCollect) return;
             OpinionInBuilding.TryMarkSimulating();
-            OpinionInBuilding.GetRandomStatesForMap(map).Add((uint) (state >> 32));
+            OpinionInBuilding.GetRandomStatesForMap(map).Add((uint)(state >> 32));
         }
 
         /// <summary>
@@ -202,7 +203,8 @@ namespace Multiplayer.Client
 
             int hash = Gen.HashCombineInt(info1.GetHashCode(), info2.GetHashCode());
 
-            OpinionInBuilding.desyncStackTraces.Add(new StackTraceLogItemObj {
+            OpinionInBuilding.desyncStackTraces.Add(new StackTraceLogItemObj
+            {
                 tick = TickPatch.Timer,
                 hash = hash,
                 info1 = info1,

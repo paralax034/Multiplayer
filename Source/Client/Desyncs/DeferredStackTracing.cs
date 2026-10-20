@@ -59,9 +59,9 @@ namespace Multiplayer.Client.Desyncs
             if (Rand.stateStack.Count > 1) return false;
             if (Multiplayer.IsReplay) return false;
 
-            // Skip tracing only during heavy catch-up (> MaxTraceDepth ticks behind) to maintain fast simulation.
-            // When approaching live lockstep, keep tracing enabled so forensic logs have client-side context.
-            if (TickPatch.Simulating && (TickPatch.tickUntil - TickPatch.Timer) > MaxTraceDepth) return false;
+            // Skip tracing during heavy catch-up to maintain fast simulation for normal users.
+            // In debug mode, trace everything to ensure forensic data is always available.
+            if (!MpVersion.IsDebug && TickPatch.Simulating && (TickPatch.tickUntil - TickPatch.Timer) > MaxTraceDepth) return false;
 
             if (!Multiplayer.Ticking && !Multiplayer.ExecutingCmds) return false;
 

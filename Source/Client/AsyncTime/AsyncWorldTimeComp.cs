@@ -372,5 +372,16 @@ public class AsyncWorldTimeComp : IExposable, ITickable
     public void FinalizeInit()
     {
         Multiplayer.game.SetThingMakerSeed((int)(randState >> 32));
+
+        // Restore global commands received during ProgramState != Playing.
+        // When consistentCommandOrder is true, all map commands are routed to the global queue.
+        // Previously, these commands were lost because AsyncWorldTimeComp never deserialized them from the snapshot.
+        if (Multiplayer.session?.dataSnapshot?.MapCmds != null)
+        {
+            cmds = new Queue<ScheduledCommand>(
+                Multiplayer.session.dataSnapshot.MapCmds.GetValueSafe(ScheduledCommand.Global) ?? []
+            );
+            MpLog.Debug($"Init world with cmds {cmds.Count}");
+        }
     }
 }
