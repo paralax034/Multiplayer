@@ -32,13 +32,16 @@ namespace Multiplayer.Client.Networking
             return (localClient, localServer);
         }
 
-        protected override void SendRaw(byte[] raw, bool reliable = true)
+        protected override void SendRaw(byte[] raw, int offset, int length, bool reliable = true)
         {
+            byte[] copy = new byte[length];
+            Buffer.BlockCopy(raw, offset, copy, 0, length);
+
             enqueue(() =>
             {
                 try
                 {
-                    remoteConn.HandleReceiveRaw(new ByteReader(raw), reliable);
+                    remoteConn.HandleReceiveRaw(new ByteReader(copy), reliable);
                 }
                 catch (Exception e)
                 {

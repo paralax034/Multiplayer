@@ -15,12 +15,12 @@ public class RecordingConnection : ConnectionBase
 
     public override int Latency { get => 0; set { } }
 
-    protected override void SendRaw(byte[] raw, bool reliable)
+    protected override void SendRaw(byte[] raw, int offset, int length, bool reliable = true)
     {
-        if (raw.Length == 0)
+        if (length == 0)
             return;
 
-        SentPackets.Add((Packets)(raw[0] & 0x3F));
+        SentPackets.Add((Packets)(raw[offset] & 0x3F));
     }
 
     protected override void OnClose(ServerDisconnectPacket? goodbye) { }

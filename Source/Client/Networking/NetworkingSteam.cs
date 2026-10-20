@@ -17,27 +17,32 @@ namespace Multiplayer.Client.Networking
         public readonly ushort recvChannel = recvChannel; // currently only for client
         public readonly ushort sendChannel = sendChannel; // currently only for server
 
-        protected override void SendRaw(byte[] raw, bool reliable = true)
-        {
-            byte[] full = new byte[1 + raw.Length];
-            full[0] = reliable ? (byte)2 : (byte)0;
-            raw.CopyTo(full, 1);
+        [ThreadStatic]
+        private static byte[] steamBuffer;
 
-            SendRawSteam(full, reliable);
+        protected override void SendRaw(byte[] raw, int offset, int length, bool reliable = true)
+        {
+            if (steamBuffer == null || steamBuffer.Length < length + 1)
+                steamBuffer = new byte[length + 1 + 1024];
+
+            steamBuffer[0] = reliable ? (byte)2 : (byte)0;
+            Buffer.BlockCopy(raw, offset, steamBuffer, 1, length);
+
+            SendRawSteam(steamBuffer, length + 1, reliable);
         }
 
-        public void SendRawSteam(byte[] raw, bool reliable)
+        public void SendRawSteam(byte[] raw, int length, bool reliable)
         {
             var sent = SteamNetworking.SendP2PPacket(
                 remoteId,
                 raw,
-                (uint)raw.Length,
+                (uint)length,
                 reliable ? EP2PSend.k_EP2PSendReliable : EP2PSend.k_EP2PSendUnreliable,
                 sendChannel
             );
             if (sent) return;
-            var hex = raw.SubArray(0, Math.Min(raw.Length, 128)).ToHexString();
-            ServerLog.Error($"Failed to send packet (len: {raw.Length}): {hex}");
+            var hex = raw.SubArray(0, Math.Min(length, 128)).ToHexString();
+            ServerLog.Error($"Failed to send packet (len: {length}): {hex}");
         }
 
         public abstract void OnError(EP2PSessionError error);
@@ -234,7 +239,11 @@ namespace Multiplayer.Client.Networking
 
                 yield return new SteamPacket
                 {
-                    remote = remote, data = reader, joinPacket = joinPacket, reliable = reliable, channel = channel
+                    remote = remote,
+                    data = reader,
+                    joinPacket = joinPacket,
+                    reliable = reliable,
+                    channel = channel
                 };
             }
         }

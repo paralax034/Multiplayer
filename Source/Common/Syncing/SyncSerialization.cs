@@ -24,6 +24,57 @@ namespace Multiplayer.Common
 
         public Action<string> errorLogger = msg => Console.WriteLine($"Sync Error: {msg}");
 
+        public static class SyncCache<T>
+        {
+            public static bool initialized;
+            public static Action<SyncSerialization, ByteWriter, T>? writer;
+            public static Func<SyncSerialization, ByteReader, T>? reader;
+        }
+
+        private static void InitializeCache<T>()
+        {
+            Type t = typeof(T);
+            System.Reflection.MethodInfo? writeMethod = null;
+            System.Reflection.MethodInfo? readMethod = null;
+
+            Type checkType = t.IsEnum ? Enum.GetUnderlyingType(t) : t;
+
+            if (checkType == typeof(byte)) { writeMethod = AccessTools.Method(typeof(ByteWriter), nameof(ByteWriter.WriteByte)); readMethod = AccessTools.Method(typeof(ByteReader), nameof(ByteReader.ReadByte)); }
+            else if (checkType == typeof(sbyte)) { writeMethod = AccessTools.Method(typeof(ByteWriter), nameof(ByteWriter.WriteSByte)); readMethod = AccessTools.Method(typeof(ByteReader), nameof(ByteReader.ReadSByte)); }
+            else if (checkType == typeof(short)) { writeMethod = AccessTools.Method(typeof(ByteWriter), nameof(ByteWriter.WriteShort)); readMethod = AccessTools.Method(typeof(ByteReader), nameof(ByteReader.ReadShort)); }
+            else if (checkType == typeof(ushort)) { writeMethod = AccessTools.Method(typeof(ByteWriter), nameof(ByteWriter.WriteUShort)); readMethod = AccessTools.Method(typeof(ByteReader), nameof(ByteReader.ReadUShort)); }
+            else if (checkType == typeof(int)) { writeMethod = AccessTools.Method(typeof(ByteWriter), nameof(ByteWriter.WriteInt32)); readMethod = AccessTools.Method(typeof(ByteReader), nameof(ByteReader.ReadInt32)); }
+            else if (checkType == typeof(uint)) { writeMethod = AccessTools.Method(typeof(ByteWriter), nameof(ByteWriter.WriteUInt32)); readMethod = AccessTools.Method(typeof(ByteReader), nameof(ByteReader.ReadUInt32)); }
+            else if (checkType == typeof(long)) { writeMethod = AccessTools.Method(typeof(ByteWriter), nameof(ByteWriter.WriteLong)); readMethod = AccessTools.Method(typeof(ByteReader), nameof(ByteReader.ReadLong)); }
+            else if (checkType == typeof(ulong)) { writeMethod = AccessTools.Method(typeof(ByteWriter), nameof(ByteWriter.WriteULong)); readMethod = AccessTools.Method(typeof(ByteReader), nameof(ByteReader.ReadULong)); }
+            else if (checkType == typeof(float)) { writeMethod = AccessTools.Method(typeof(ByteWriter), nameof(ByteWriter.WriteFloat)); readMethod = AccessTools.Method(typeof(ByteReader), nameof(ByteReader.ReadFloat)); }
+            else if (checkType == typeof(double)) { writeMethod = AccessTools.Method(typeof(ByteWriter), nameof(ByteWriter.WriteDouble)); readMethod = AccessTools.Method(typeof(ByteReader), nameof(ByteReader.ReadDouble)); }
+            else if (checkType == typeof(bool)) { writeMethod = AccessTools.Method(typeof(ByteWriter), nameof(ByteWriter.WriteBool)); readMethod = AccessTools.Method(typeof(ByteReader), nameof(ByteReader.ReadBool)); }
+            else if (checkType == typeof(string)) { writeMethod = AccessTools.Method(typeof(ByteWriter), nameof(ByteWriter.WriteString)); readMethod = AccessTools.Method(typeof(ByteReader), nameof(ByteReader.ReadString), [typeof(int)]); }
+
+            if (writeMethod != null && readMethod != null)
+            {
+                var dmWrite = new System.Reflection.Emit.DynamicMethod("WriteFast_" + t.Name, null, [typeof(SyncSerialization), typeof(ByteWriter), t], true);
+                var ilWrite = dmWrite.GetILGenerator();
+                ilWrite.Emit(System.Reflection.Emit.OpCodes.Ldarg_1); // writer
+                ilWrite.Emit(System.Reflection.Emit.OpCodes.Ldarg_2); // value
+                ilWrite.Emit(System.Reflection.Emit.OpCodes.Callvirt, writeMethod);
+                ilWrite.Emit(System.Reflection.Emit.OpCodes.Ret);
+                SyncCache<T>.writer = (Action<SyncSerialization, ByteWriter, T>)dmWrite.CreateDelegate(typeof(Action<SyncSerialization, ByteWriter, T>));
+
+                var dmRead = new System.Reflection.Emit.DynamicMethod("ReadFast_" + t.Name, t, [typeof(SyncSerialization), typeof(ByteReader)], true);
+                var ilRead = dmRead.GetILGenerator();
+                ilRead.Emit(System.Reflection.Emit.OpCodes.Ldarg_1); // reader
+                if (checkType == typeof(string))
+                    ilRead.Emit(System.Reflection.Emit.OpCodes.Ldc_I4, 32767); // default max string len
+                ilRead.Emit(System.Reflection.Emit.OpCodes.Callvirt, readMethod);
+                ilRead.Emit(System.Reflection.Emit.OpCodes.Ret);
+                SyncCache<T>.reader = (Func<SyncSerialization, ByteReader, T>)dmRead.CreateDelegate(typeof(Func<SyncSerialization, ByteReader, T>));
+            }
+
+            SyncCache<T>.initialized = true;
+        }
+
         public void AddCanHandleHook(CanHandleHook hook)
         {
             canHandleHooks.Add(hook);
@@ -62,7 +113,7 @@ namespace Multiplayer.Common
                 return type.GetArrayRank() == 1 && CanHandle(type.GetElementType());
 
             if (type.IsGenericType &&
-                type.GetGenericTypeDefinition() is { } gtd&&
+                type.GetGenericTypeDefinition() is { } gtd &&
                 (supportedSystemGtds.Contains(gtd) || typeof(ITuple).IsAssignableFrom(gtd)))
                 return CanHandleGenericArgs(type);
 
@@ -82,6 +133,9 @@ namespace Multiplayer.Common
 
         public T? ReadSync<T>(ByteReader data)
         {
+            if (!SyncCache<T>.initialized) InitializeCache<T>();
+            if (SyncCache<T>.reader != null) return SyncCache<T>.reader!(this, data);
+
             return (T?)ReadSyncObject(data, typeof(T));
         }
 
@@ -135,7 +189,8 @@ namespace Multiplayer.Common
                     return null;
                 }
 
-                if (SyncDictPrimitives.syncWorkers.TryGetValue(type, out SyncWorkerEntry syncWorkerEntryEarly)) {
+                if (SyncDictPrimitives.syncWorkers.TryGetValue(type, out SyncWorkerEntry syncWorkerEntryEarly))
+                {
                     object? res = null;
 
                     if (syncWorkerEntryEarly.shouldConstruct || type.IsValueType)
@@ -146,7 +201,8 @@ namespace Multiplayer.Common
                     return res;
                 }
 
-                if (type.IsEnum) {
+                if (type.IsEnum)
+                {
                     Type underlyingType = Enum.GetUnderlyingType(type);
 
                     return Enum.ToObject(type, ReadSyncObject(data, underlyingType)!);
@@ -266,7 +322,7 @@ namespace Multiplayer.Common
                 {
                     var obj = Activator.CreateInstance(type);
 
-                    ((ISynchronizable) obj).Sync(new ReadingSyncWorker(data, this));
+                    ((ISynchronizable)obj).Sync(new ReadingSyncWorker(data, this));
                     return obj;
                 }
 
@@ -301,6 +357,13 @@ namespace Multiplayer.Common
 
         public void WriteSync<T>(ByteWriter data, T? obj)
         {
+            if (!SyncCache<T>.initialized) InitializeCache<T>();
+            if (SyncCache<T>.writer != null && obj != null)
+            {
+                SyncCache<T>.writer!(this, data, obj);
+                return;
+            }
+
             WriteSyncObject(data, obj, typeof(T));
         }
 
@@ -322,7 +385,8 @@ namespace Multiplayer.Common
                     return;
                 }
 
-                if (SyncDictPrimitives.syncWorkers.TryGetValue(type, out var syncWorkerEntryEarly)) {
+                if (SyncDictPrimitives.syncWorkers.TryGetValue(type, out var syncWorkerEntryEarly))
+                {
                     syncWorkerEntryEarly.Invoke(new WritingSyncWorker(data, this), ref obj);
 
                     return;
@@ -359,7 +423,8 @@ namespace Multiplayer.Common
                     return;
                 }
 
-                if (type.IsGenericType) {
+                if (type.IsGenericType)
+                {
                     Type genericTypeDefinition = type.GetGenericTypeDefinition();
 
                     if (genericTypeDefinition == typeof(List<>))
@@ -474,7 +539,7 @@ namespace Multiplayer.Common
 
                 if (typeof(ISynchronizable).IsAssignableFrom(type))
                 {
-                    ((ISynchronizable) obj!).Sync(new WritingSyncWorker(data, this));
+                    ((ISynchronizable)obj!).Sync(new WritingSyncWorker(data, this));
                     return;
                 }
 

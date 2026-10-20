@@ -618,15 +618,15 @@ public class ChatCommandManagerTest
 
         public override int Latency { get => 0; set { } }
 
-        protected override void SendRaw(byte[] raw, bool reliable)
+        protected override void SendRaw(byte[] raw, int offset, int length, bool reliable = true)
         {
-            var packetId = (Packets)(raw[0] & 0x3F);
+            var packetId = (Packets)(raw[offset] & 0x3F);
             PacketIds.Add(packetId);
             if (packetId != Packets.Server_Chat)
                 return;
 
             var packet = new ServerChatPacket();
-            packet.Bind(new PacketReader(new ByteReader(raw[1..])));
+            packet.Bind(new PacketReader(new ByteReader(raw[(offset + 1)..(offset + length)])));
             ChatMessages.Add(packet.msg ?? "");
             if (packet.rawMessage)
                 RawChatMessages.Add(packet.msg ?? "");

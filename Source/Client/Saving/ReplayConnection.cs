@@ -18,7 +18,7 @@ public class ReplayConnection : ConnectionBase
         }
     }
 
-    protected override void SendRaw(byte[] raw, bool reliable)
+    protected override void SendRaw(byte[] raw, int offset, int length, bool reliable)
     {
     }
 

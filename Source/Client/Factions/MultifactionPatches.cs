@@ -133,7 +133,7 @@ static class WorldObjectShowRelatedQuestsPatch
 {
     static void Postfix(ref bool __result)
     {
-        if (Multiplayer.Client != null && Multiplayer.RealPlayerFaction == Multiplayer.WorldComp.spectatorFaction)
+        if (SpectatorUtility.IsSpectator)
             __result = false;
     }
 }
@@ -143,7 +143,7 @@ static class SettlementShowRelatedQuestsPatch
 {
     static void Postfix(ref bool __result)
     {
-        if (Multiplayer.Client != null && Multiplayer.RealPlayerFaction == Multiplayer.WorldComp.spectatorFaction)
+        if (SpectatorUtility.IsSpectator)
             __result = false;
     }
 }
@@ -153,7 +153,7 @@ static class WorldInspectPanePaneTopYPatch
 {
     static void Postfix(ref float __result)
     {
-        if (Multiplayer.Client != null && Multiplayer.RealPlayerFaction == Multiplayer.WorldComp.spectatorFaction)
+        if (SpectatorUtility.IsSpectator)
             __result += 35f;
     }
 }
@@ -271,7 +271,7 @@ public static class WorldRoutePlannerPatch
 {
     static bool Prefix()
     {
-        return Multiplayer.Client == null || Multiplayer.RealPlayerFaction != Multiplayer.WorldComp.spectatorFaction;
+        return !SpectatorUtility.IsSpectator;
     }
 }
 
@@ -280,7 +280,7 @@ public static class WorldGizmoUtilityTryGetCaravanGizmoPatch
 {
     static bool Prefix(ref Gizmo gizmo, ref bool __result)
     {
-        if (Multiplayer.Client != null && Multiplayer.RealPlayerFaction == Multiplayer.WorldComp.spectatorFaction)
+        if (SpectatorUtility.IsSpectator)
         {
             gizmo = null;
             __result = false;
@@ -293,9 +293,7 @@ public static class WorldGizmoUtilityTryGetCaravanGizmoPatch
 [HarmonyPatch(typeof(MainButtonsRoot), nameof(MainButtonsRoot.DoButtons))]
 static class MainButtonsRootDoButtonsPatch
 {
-    private static bool IsSpectator =>
-      Multiplayer.Client != null &&
-      Multiplayer.RealPlayerFaction == Multiplayer.WorldComp.spectatorFaction;
+    private static bool IsSpectator => SpectatorUtility.IsSpectator;
 
     private static readonly string[] SpectatorButtons = { "Menu", "World" };
 
@@ -421,7 +419,7 @@ static class PawnChangeRelationGizmo
         foreach (var gizmo in gizmos)
             yield return gizmo;
 
-        if (Multiplayer.Client == null || Multiplayer.RealPlayerFaction == Multiplayer.WorldComp.spectatorFaction)
+        if (SpectatorUtility.IsSpectator)
             yield break;
 
         if (__instance.Faction is { IsPlayer: true } && __instance.Faction != Faction.OfPlayer)
@@ -772,26 +770,34 @@ static class TakeToBedGuestFactionPatch
     }
 }
 
+[HarmonyPatch(typeof(Pawn), nameof(Pawn.Tick))]
+static class Pawn_Tick_Spectator_Suppress_Patch
+{
+    static bool Prefix(Pawn __instance)
+    {
+        return !SpectatorUtility.IsSpectatorPawn(__instance);
+    }
+}
+
+[HarmonyPatch(typeof(Pawn), nameof(Pawn.TickInterval))]
+static class Pawn_TickInterval_Spectator_Suppress_Patch
+{
+    static bool Prefix(Pawn __instance)
+    {
+        return !SpectatorUtility.IsSpectatorPawn(__instance);
+    }
+}
+
 public static class LetterSecurityUtility
 {
     public static bool IsTargetForFaction(LookTargets lookTargets, Faction faction)
     {
         if (faction == null) return true;
         if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction) return true;
-
-        // If message has no explicit targets (e.g. GameCondition eclipse end), isolate it to the current ticking map's owner
-        if (lookTargets?.targets == null || lookTargets.targets.Count == 0)
-        {
-            var activeMap = Multiplayer.MapContext ?? Find.CurrentMap;
-            if (activeMap?.ParentFaction is { IsPlayer: true } mapOwner)
-            {
-                return mapOwner == faction;
-            }
-            return true;
-        }
+        if (lookTargets?.targets == null || lookTargets.targets.Count == 0) return true;
 
         bool hasAnyPlayerAffiliation = false;
-        bool hasAnyValidTarget = false;
+        bool hasAnyThingTarget = false;
         var targets = lookTargets.targets;
 
         for (int i = 0; i < targets.Count; i++)
@@ -799,41 +805,73 @@ public static class LetterSecurityUtility
             var target = targets[i];
             Faction targetFaction = null;
 
-            // Target is a Thing on a map or in a caravan
+            // Target is a Thing on a map, in a caravan, or despawned on a player tile
             if (target.HasThing && target.Thing != null)
             {
+                hasAnyThingTarget = true;
                 var thing = target.Thing;
-                if (thing.Faction is { IsPlayer: true } tf)
-                    targetFaction = tf;
-                else if (thing.Map?.ParentFaction is { IsPlayer: true } mf)
-                    targetFaction = mf;
-                else if (thing.MapHeld?.ParentFaction is { IsPlayer: true } mhf)
-                    targetFaction = mhf;
 
-                // A Thing is a valid anchor if it belongs to a player, or is currently spawned on a map.
-                if (thing.Faction is { IsPlayer: true } || thing.Map != null || thing.MapHeld != null)
-                    hasAnyValidTarget = true;
+                if (thing.Faction is { IsPlayer: true } tf)
+                {
+                    targetFaction = tf;
+                }
+                else if (thing.Map?.ParentFaction is { IsPlayer: true } mf)
+                {
+                    targetFaction = mf;
+                }
+                else if (thing.MapHeld?.ParentFaction is { IsPlayer: true } mhf)
+                {
+                    targetFaction = mhf;
+                }
+                else if (thing.Tile.Valid)
+                {
+                    // Match despawn tile against player map tiles to retain ownership after despawn
+                    var maps = Find.Maps;
+                    for (int m = 0; m < maps.Count; m++)
+                    {
+                        var map = maps[m];
+                        if (map.Tile == thing.Tile && map.ParentFaction is { IsPlayer: true } mapFac)
+                        {
+                            targetFaction = mapFac;
+                            break;
+                        }
+                    }
+
+                    if (targetFaction == null)
+                    {
+                        var settlements = Find.WorldObjects?.Settlements;
+                        if (settlements != null)
+                        {
+                            for (int s = 0; s < settlements.Count; s++)
+                            {
+                                var settlement = settlements[s];
+                                if (settlement.Tile == thing.Tile && settlement.Faction is { IsPlayer: true } setFac)
+                                {
+                                    targetFaction = setFac;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
             }
             // Target is a WorldObject (Caravan, Settlement, MapParent)
             else if (target.HasWorldObject && target.WorldObject != null)
             {
-                hasAnyValidTarget = true;
                 var worldObj = target.WorldObject;
                 if (worldObj.Faction is { IsPlayer: true } wf)
+                {
                     targetFaction = wf;
+                }
                 else if (worldObj is Caravan caravan && caravan.Faction is { IsPlayer: true } cf)
+                {
                     targetFaction = cf;
+                }
             }
             // Target is a cell on a player map
             else if (target.Map?.ParentFaction is { IsPlayer: true } cellMapFac)
             {
-                hasAnyValidTarget = true;
                 targetFaction = cellMapFac;
-            }
-            else
-            {
-                // Fallback for abstract targets (like raw world tiles) to prevent accidental hiding
-                hasAnyValidTarget = true;
             }
 
             if (targetFaction != null)
@@ -844,12 +882,12 @@ public static class LetterSecurityUtility
             }
         }
 
-        // If all targeted Things are despawned NPCs (e.g. guests who left the map), they lose their map affiliation.
-        // Hide the letter to prevent it from falling back to global and appearing on other players' screens.
-        if (!hasAnyValidTarget)
+        // Entity events that fail resolution must not fall back to public broadcasts
+        if (hasAnyThingTarget && !hasAnyPlayerAffiliation)
+        {
             return false;
+        }
 
-        // If the event targets another player's colony/caravan, hide it completely
         return !hasAnyPlayerAffiliation;
     }
 
@@ -1279,7 +1317,7 @@ static class IgnoreSpectatorWorldPawnsTickPatch
         }
     }
 
-    private static readonly List<Pawn> tmpFiltered = new();
+    private static readonly List<Pawn> tmpFiltered = [];
     private static readonly Comparison<Pawn> PawnIdComparer = (a, b) => a.thingIDNumber.CompareTo(b.thingIDNumber);
 
     public static IEnumerable<Pawn> FilterPawnsAlive(HashSet<Pawn> pawns)
@@ -1287,14 +1325,10 @@ static class IgnoreSpectatorWorldPawnsTickPatch
         if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction)
             return pawns;
 
-        var spectator = Multiplayer.WorldComp?.spectatorFaction;
-        if (spectator == null)
-            return pawns;
-
         tmpFiltered.Clear();
         foreach (var p in pawns)
         {
-            if (p != null && p.Faction != spectator)
+            if (p != null && !SpectatorUtility.IsSpectatorPawn(p))
                 tmpFiltered.Add(p);
         }
 

@@ -33,10 +33,10 @@ namespace Multiplayer.Common
         public const int NetTicksPerSecond = 30; // Not an exact amount. The net loop isn't particularly precise.
 
         // Adaptive network lag thresholds and multipliers
-        public const int LagSlowdownMinTicks = 30;
-        public const int LagSlowdownMaxTicks = 120;
+        public const int LagSlowdownMinTicks = 75;
+        public const int LagSlowdownMaxTicks = 180;
         public const int LagCriticalThresholdTicks = 300;
-        public const float MaxSlowdownMultiplier = 2.0f;
+        public const float MaxSlowdownMultiplier = 0.5f;
 
         public static readonly Regex UsernamePattern = new(@"^[a-zA-Z0-9_]+$");
 
@@ -124,7 +124,8 @@ namespace Multiplayer.Common
                     TickNet();
 
                     int ticked = 0;
-                    while (realTime > 0 && ticked < 2)
+                    // Allow up to 3 ticks per net cycle to smoothly absorb OS timer sleep jitter
+                    while (realTime > 0 && ticked < 3)
                     {
                         // Zero-allocation flat iteration across players
                         var players = playerManager.Players;
@@ -160,12 +161,12 @@ namespace Multiplayer.Common
                             gameTimer++;
                             sentCmdsSnapshot = commands.SentCmds;
 
-                            // Linear slowdown from 1x down to 0.5x between LagSlowdownMinTicks and LagSlowdownMaxTicks
+                            // Gentle linear slowdown between LagSlowdownMinTicks and LagSlowdownMaxTicks
                             float slowdown = 0f;
                             if (maxExtrapolated > LagSlowdownMinTicks)
                             {
                                 float lagProgress = (float)(maxExtrapolated - LagSlowdownMinTicks) / (LagSlowdownMaxTicks - LagSlowdownMinTicks);
-                                slowdown = Math.Min(lagProgress, MaxSlowdownMultiplier);
+                                slowdown = Math.Min(lagProgress * MaxSlowdownMultiplier, MaxSlowdownMultiplier);
                             }
 
                             realTime -= serverTimePerTick * (1f + slowdown);

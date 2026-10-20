@@ -40,14 +40,21 @@ namespace Multiplayer.Common
 
         public void Send(Packets id) => Send(id, []);
 
-        public void Send(SerializedPacket packet, bool reliable = true) => Send(packet.id, packet.data, reliable);
+        public void Send(SerializedPacket packet, bool reliable = true)
+        {
+            byte[] full = new byte[1 + packet.data.Length];
+            full[0] = (byte)(Convert.ToByte(packet.id) & 0x3F);
+            Buffer.BlockCopy(packet.data, 0, full, 1, packet.data.Length);
+            SendRaw(full, 0, full.Length, reliable);
+        }
 
         public void Send<T>(T packet, bool reliable = true) where T : struct, IPacket
         {
             var writer = new ByteWriter();
+            writer.WriteByte((byte)(Convert.ToByte(packet.GetId()) & 0x3F));
             packet.Bind(new PacketWriter(writer));
 
-            Send(packet.GetId(), writer.ToArray(), reliable);
+            SendRaw(writer.GetInternalBuffer(), 0, writer.Position, reliable);
         }
 
         protected virtual void Send(Packets id, byte[] message, bool reliable = true)
@@ -60,9 +67,9 @@ namespace Multiplayer.Common
 
             byte[] full = new byte[1 + message.Length];
             full[0] = (byte)(Convert.ToByte(id) & 0x3F);
-            message.CopyTo(full, 1);
+            Buffer.BlockCopy(message, 0, full, 1, message.Length);
 
-            SendRaw(full, reliable);
+            SendRaw(full, 0, full.Length, reliable);
         }
 
         // Steam doesn't like messages bigger than a megabyte
@@ -75,7 +82,7 @@ namespace Multiplayer.Common
 
         private const int FragNone = 0x0;
         private const int FragMore = 0x40;
-        private const int FragEnd  = 0x80;
+        private const int FragEnd = 0x80;
 
         private byte sendFragId;
 
@@ -131,7 +138,7 @@ namespace Multiplayer.Common
                 writer.WriteFrom(message, read, len);
 
                 // SendRaw copies this data so we can freely clear the writer after it executes.
-                SendRaw(writer.ToArray(), reliable: true);
+                SendRaw(writer.GetInternalBuffer(), 0, writer.Position, reliable: true);
                 writer.SetLength(0);
 
                 read += len;
@@ -140,7 +147,7 @@ namespace Multiplayer.Common
 
         public void SendFragmented(SerializedPacket packet) => SendFragmented(packet.id, packet.data);
 
-        protected abstract void SendRaw(byte[] raw, bool reliable = true);
+        protected abstract void SendRaw(byte[] raw, int offset, int length, bool reliable = true);
 
         public virtual void HandleReceiveRaw(ByteReader data, bool reliable)
         {

@@ -7,10 +7,10 @@ namespace Multiplayer.Common
     {
         public readonly NetPeer peer = peer;
 
-        protected override void SendRaw(byte[] raw, bool reliable)
+        protected override void SendRaw(byte[] raw, int offset, int length, bool reliable)
         {
             if (peer.ConnectionState == ConnectionState.Connected)
-                peer.Send(raw, reliable ? DeliveryMethod.ReliableOrdered : DeliveryMethod.Unreliable);
+                peer.Send(raw, offset, length, reliable ? DeliveryMethod.ReliableOrdered : DeliveryMethod.Unreliable);
             else
                 ServerLog.Error($"SendRaw() called with invalid connection state ({peer}): {peer.ConnectionState}");
         }

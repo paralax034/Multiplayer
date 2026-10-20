@@ -75,6 +75,24 @@ namespace Multiplayer.Client
             return TickablesBuffer;
         }
 
+        public static ITickable TickableById(int tickableId)
+        {
+            if (tickableId == ScheduledCommand.Global || tickableId == -1)
+                return Multiplayer.AsyncWorldTime;
+
+            var maps = Find.Maps;
+            if (maps != null)
+            {
+                for (int i = 0; i < maps.Count; i++)
+                {
+                    if (maps[i].uniqueID == tickableId)
+                        return maps[i].AsyncTime();
+                }
+            }
+
+            return null;
+        }
+
         static bool Prefix()
         {
             if (Multiplayer.Client == null) return true;
@@ -95,17 +113,23 @@ namespace Multiplayer.Client
             if (Timer >= tickUntil)
             {
                 ticksToRun = 0;
+                if (realTime > 0)
+                    realTime = 0;
             }
             else if (realTime > 0 && stpt > 0)
             {
                 avgFrameTime = (avgFrameTime + Time.deltaTime * 1000f) / 2f;
 
-                ticksToRun = Multiplayer.IsReplay ? Mathf.CeilToInt(realTime / stpt) : 1;
+                int calculatedTicks = Mathf.CeilToInt(realTime / stpt);
+                int maxCatchupTicks = Mathf.Max(0, tickUntil - Timer);
+
+                // Allow up to 30 ticks per frame to natively support dev ultrafast speed (15 ticks/frame) and fast catch-up
+                ticksToRun = Multiplayer.IsReplay
+                    ? calculatedTicks
+                    : Mathf.Clamp(calculatedTicks, 1, Mathf.Min(maxCatchupTicks, 30));
+
                 realTime -= ticksToRun * stpt;
             }
-
-            if (realTime > 0)
-                realTime = 0;
 
             if (Time.time - frameTimeSentAt > 32f / 1000f)
             {
@@ -124,7 +148,7 @@ namespace Multiplayer.Client
             if (MpVersion.IsDebug)
                 SimpleProfiler.Start();
 
-            RunCmds();
+            // RunCmds is executed exclusively inside DoUpdate to guarantee deterministic callstack hashes
             if (LongEventHandler.eventQueue.Count == 0)
             {
                 DoUpdate(out var worked);
@@ -217,14 +241,18 @@ namespace Multiplayer.Client
             updateTimer.Reset();
             updateTimer.Start();
 
+            var tickables = GetTickables();
+
+            // Always process commands for current tick under DoUpdate frame (even when paused)
+            if (RunCmds(tickables))
+                return;
+
             while (Simulating ? (Timer < simulating.target && updateTimer.ElapsedMilliseconds < SimulatingSliceBudgetMs) : (ticksToRun > 0))
             {
-                var tickables = GetTickables();
-
-                if (RunCmds(tickables))
+                if (DoTick(ref worked, tickables))
                     return;
 
-                if (DoTick(ref worked, tickables))
+                if (RunCmds(tickables))
                     return;
             }
         }
@@ -340,17 +368,6 @@ namespace Multiplayer.Client
         }
 
         public static void SetTimer(int value) => Timer = value;
-
-        public static ITickable TickableById(int tickableId)
-        {
-            var tickables = GetTickables();
-            for (int i = 0; i < tickables.Count; i++)
-            {
-                if (tickables[i].TickableId == tickableId)
-                    return tickables[i];
-            }
-            return null;
-        }
     }
 
     public class SimulatingData

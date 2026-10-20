@@ -50,41 +50,50 @@ public class MultiplayerWorldComp : IHasSessionData
 
         if (spectatorFaction == null)
         {
-            void AddSpectatorFaction()
-            {
-                spectatorFaction = HostUtil.AddNewFaction("Spectator", FactionDefOf.PlayerColony);
+            // First attempt to resolve the existing spectator faction from FactionManager before creating a new one
+            spectatorFaction = Find.FactionManager.AllFactions
+                .FirstOrDefault(f => f.IsPlayer && f.Name == SpectatorUtility.SpectatorFactionName);
 
+            if (spectatorFaction == null)
+            {
+                void AddSpectatorFaction()
+                {
+                    spectatorFaction = HostUtil.AddNewFaction(SpectatorUtility.SpectatorFactionName, FactionDefOf.PlayerColony);
+
+                    factionData[spectatorFaction.loadID] = FactionWorldData.New(spectatorFaction.loadID);
+                    factionData[spectatorFaction.loadID].ReassignIds();
+
+                    foreach (var map in Find.Maps)
+                        MapSetup.InitNewFactionData(map, spectatorFaction);
+                }
+
+                void RemoveOpponentFaction()
+                {
+                    // Test faction left in by mistake in version 0.7
+                    var opponent =
+                        Find.FactionManager.AllFactions.FirstOrDefault(f => f.Name == "Opponent" && f.IsPlayer);
+
+                    if (opponent is not null)
+                    {
+                        opponent.RemoveAllRelations();
+                        Find.FactionManager.allFactions.Remove(opponent);
+                        Log.Warning("Multiplayer removed dummy Opponent faction");
+                    }
+                }
+
+                AddSpectatorFaction();
+                RemoveOpponentFaction();
+            }
+            else if (!factionData.ContainsKey(spectatorFaction.loadID))
+            {
                 factionData[spectatorFaction.loadID] = FactionWorldData.New(spectatorFaction.loadID);
                 factionData[spectatorFaction.loadID].ReassignIds();
-
-                foreach (var map in Find.Maps)
-                    MapSetup.InitNewFactionData(map, spectatorFaction);
             }
-
-            void RemoveOpponentFaction()
-            {
-                // Test faction left in by mistake in version 0.7
-                var opponent =
-                    Find.FactionManager.AllFactions.FirstOrDefault(f => f.Name == "Opponent" && f.IsPlayer);
-
-                if (opponent is not null)
-                {
-                    opponent.RemoveAllRelations();
-                    Find.FactionManager.allFactions.Remove(opponent);
-                    Log.Warning("Multiplayer removed dummy Opponent faction");
-                }
-            }
-
-            AddSpectatorFaction();
-            RemoveOpponentFaction();
         }
 
         // Fix old save files by ensuring all factions have access to Anomaly research if
         // it was enabled. This needs to be done since Anomaly state is shared by all players.
         var anomaly = Find.Anomaly;
-        // Don't use anomaly.Level, as it'll return 0 due to monolith not being
-        // spawned. If we want to include that check then we'd need to move this
-        // code into a postfix to Building_VoidMonolith:SpawnSetup.
         if (anomaly.level > 0 && anomaly.monolith != null)
         {
             foreach (var (_, data) in factionData)

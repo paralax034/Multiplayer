@@ -11,7 +11,8 @@ namespace Multiplayer.Client
         {
             this.username = username;
             // The flag byte is: joinPacket | reliable | hasChannel
-            conn.SendRawSteam(ByteWriter.GetBytes((byte)0b111, conn.recvChannel), true);
+            byte[] data = ByteWriter.GetBytes((byte)0b111, conn.recvChannel);
+            conn.SendRawSteam(data, data.Length, true);
         }
 
         [PacketHandler(Packets.Server_SteamAccept)]

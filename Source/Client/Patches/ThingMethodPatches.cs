@@ -28,26 +28,21 @@ namespace Multiplayer.Client
     [HarmonyPatch(typeof(Pawn_NeedsTracker), nameof(Pawn_NeedsTracker.AddOrRemoveNeedsAsAppropriate))]
     static class AddRemoveNeedsPatch
     {
-        static bool Prefix(Pawn ___pawn, ref int? __state)
+        static void Prefix(Pawn ___pawn, ref Map __state)
         {
-            if (Scribe.mode == LoadSaveMode.LoadingVars)
-                return false;
+            if (Multiplayer.Client == null || ___pawn?.Faction == null) return;
 
-            if (Multiplayer.Client == null) return true;
-            if (___pawn.Faction == null) return true;
-
-            __state = FactionContext.stack.Count;
-            ___pawn.Map?.PushFaction(___pawn.Faction);
-
-            return true;
+            var map = ___pawn.Map;
+            if (map != null)
+            {
+                map.PushFaction(___pawn.Faction);
+                __state = map;
+            }
         }
 
-        static void Finalizer(int? __state)
+        static void Finalizer(Map __state)
         {
-            if (!__state.HasValue) return;
-
-            while (FactionContext.stack.Count > __state.Value)
-                FactionContext.Pop();
+            __state?.PopFaction();
         }
     }
 
