@@ -11,16 +11,31 @@ namespace Multiplayer.Client.Persistent;
 
 public class SessionManager : IHasSessionData, ISessionManager
 {
-    public IReadOnlyList<Session> AllSessions => allSessions.AsReadOnly();
-    public IReadOnlyList<ExposableSession> ExposableSessions => exposableSessions.AsReadOnly();
-    public IReadOnlyList<SemiPersistentSession> SemiPersistentSessions => semiPersistentSessions.AsReadOnly();
-    public IReadOnlyList<ITickingSession> TickingSessions => tickingSessions.AsReadOnly();
+    /// <summary>
+    /// Exposes registered sessions directly as IReadOnlyList without allocating ReadOnlyCollection wrappers on property access.
+    /// </summary>
+    public IReadOnlyList<Session> AllSessions => allSessions;
 
-    private List<Session> allSessions = new();
-    private List<ExposableSession> exposableSessions = new();
-    private List<SemiPersistentSession> semiPersistentSessions = new();
-    private List<ITickingSession> tickingSessions = new();
-    private static HashSet<Type> tempCleanupLoggingTypes = new();
+    /// <summary>
+    /// Exposes exposable sessions directly as IReadOnlyList to prevent GC heap pressure.
+    /// </summary>
+    public IReadOnlyList<ExposableSession> ExposableSessions => exposableSessions;
+
+    /// <summary>
+    /// Exposes semi-persistent sessions directly as IReadOnlyList without wrapper allocations.
+    /// </summary>
+    public IReadOnlyList<SemiPersistentSession> SemiPersistentSessions => semiPersistentSessions;
+
+    /// <summary>
+    /// Exposes ticking sessions directly as IReadOnlyList without wrapper allocations.
+    /// </summary>
+    public IReadOnlyList<ITickingSession> TickingSessions => tickingSessions;
+
+    private List<Session> allSessions = [];
+    private List<ExposableSession> exposableSessions = [];
+    private List<SemiPersistentSession> semiPersistentSessions = [];
+    private List<ITickingSession> tickingSessions = [];
+    private static readonly HashSet<Type> tempCleanupLoggingTypes = [];
 
     public Map Map { get; }
     public bool AnySessionActive => allSessions.Count > 0;
@@ -109,11 +124,19 @@ public class SessionManager : IHasSessionData, ISessionManager
         return false;
     }
 
+    /// <summary>
+    /// Scans active sessions for mutually exclusive coexistence constraints using indexed loop to avoid LINQ allocations.
+    /// </summary>
     private Session GetFirstConflictingSession(Session session)
     {
-        // Should the check be two-way? A property for optional two-way check?
         if (session is ISessionWithCreationRestrictions restrictions)
-            return allSessions.FirstOrDefault(s => !restrictions.CanExistWith(s));
+        {
+            for (int i = 0; i < allSessions.Count; i++)
+            {
+                if (!restrictions.CanExistWith(allSessions[i]))
+                    return allSessions[i];
+            }
+        }
 
         return null;
     }
@@ -142,13 +165,61 @@ public class SessionManager : IHasSessionData, ISessionManager
         }
     }
 
-    public T GetFirstOfType<T>() where T : Session => allSessions.OfType<T>().FirstOrDefault();
+    /// <summary>
+    /// Finds the first registered session matching type T without LINQ OfType or FirstOrDefault allocations.
+    /// </summary>
+    public T GetFirstOfType<T>() where T : Session
+    {
+        for (int i = 0; i < allSessions.Count; i++)
+        {
+            if (allSessions[i] is T match)
+                return match;
+        }
 
-    public T GetFirstOfType<T>(Func<T, bool> predicate) where T : Session => allSessions.OfType<T>().FirstOrDefault(predicate);
+        return null;
+    }
 
-    public T GetFirstWithId<T>(int id) where T : Session => allSessions.OfType<T>().FirstOrDefault(s => s.SessionId == id);
+    /// <summary>
+    /// Finds the first registered session matching type T and a custom predicate without LINQ closures.
+    /// </summary>
+    public T GetFirstOfType<T>(Func<T, bool> predicate) where T : Session
+    {
+        for (int i = 0; i < allSessions.Count; i++)
+        {
+            if (allSessions[i] is T match && predicate(match))
+                return match;
+        }
 
-    public Session GetFirstWithId(int id) => allSessions.FirstOrDefault(s => s.SessionId == id);
+        return null;
+    }
+
+    /// <summary>
+    /// Retrieves a typed session by its network session identifier.
+    /// </summary>
+    public T GetFirstWithId<T>(int id) where T : Session
+    {
+        for (int i = 0; i < allSessions.Count; i++)
+        {
+            if (allSessions[i].SessionId == id && allSessions[i] is T match)
+                return match;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Retrieves an untyped base session by its network session identifier.
+    /// </summary>
+    public Session GetFirstWithId(int id)
+    {
+        for (int i = 0; i < allSessions.Count; i++)
+        {
+            if (allSessions[i].SessionId == id)
+                return allSessions[i];
+        }
+
+        return null;
+    }
 
     public void WriteSessionData(ByteWriter data)
     {
@@ -275,11 +346,15 @@ public class SessionManager : IHasSessionData, ISessionManager
         }
     }
 
+    /// <summary>
+    /// Checks if any active session is forcing simulation pause on the target map.
+    /// Evaluated on each tick cycle; uses direct list indexing to remain zero-alloc.
+    /// </summary>
     public bool IsAnySessionCurrentlyPausing(Map map)
     {
         for (int i = 0; i < allSessions.Count; i++)
         {
-            if (AllSessions[i].IsCurrentlyPausing(map))
+            if (allSessions[i].IsCurrentlyPausing(map))
                 return true;
         }
 

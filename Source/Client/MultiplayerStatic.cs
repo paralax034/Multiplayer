@@ -126,17 +126,33 @@ namespace Multiplayer.Client
             MultiplayerData.staticCtorRoundMode = RoundMode.GetCurrentRoundMode();
         }
 
+        /// <summary>
+        /// Resolves and sanitizes the player's username.
+        /// Uses direct character filtering instead of ad-hoc Regex instantiation to eliminate heap allocations.
+        /// </summary>
         private static void SetUsername()
         {
             Multiplayer.username = Multiplayer.settings.username;
 
             if (Multiplayer.username == null)
             {
-                Multiplayer.username = SteamManager.Initialized ?
-                    SteamUtility.SteamPersonaName : NameGenerator.GenerateName(RulePackDefOf.NamerTraderGeneral);
+                string rawName = SteamManager.Initialized
+                    ? SteamUtility.SteamPersonaName
+                    : NameGenerator.GenerateName(RulePackDefOf.NamerTraderGeneral);
 
-                Multiplayer.username = new Regex("[^a-zA-Z0-9_]").Replace(Multiplayer.username, string.Empty);
-                Multiplayer.username = Multiplayer.username.TrimmedToLength(MultiplayerServer.MaxUsernameLength);
+                // Fast-path sanitization: retain only alphanumeric characters and underscores without Regex
+                char[] cleanChars = new char[rawName.Length];
+                int cleanLength = 0;
+                for (int i = 0; i < rawName.Length; i++)
+                {
+                    char c = rawName[i];
+                    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')
+                    {
+                        cleanChars[cleanLength++] = c;
+                    }
+                }
+
+                Multiplayer.username = new string(cleanChars, 0, cleanLength).TrimmedToLength(MultiplayerServer.MaxUsernameLength);
                 Multiplayer.settings.username = Multiplayer.username;
                 Multiplayer.settings.Write();
             }
@@ -190,7 +206,7 @@ namespace Multiplayer.Client
                                         void Log(string text) => output += text + "\n";
 
                                         Log($"Ticks done: {ticksDone}");
-                                        Log($"TPS: {1000.0/(timeSpent / ticksDone)}");
+                                        Log($"TPS: {1000.0 / (timeSpent / ticksDone)}");
                                         Log($"Timer: {TickPatch.Timer}");
                                         Log($"World: {Multiplayer.AsyncWorldTime.worldTicks}/{Multiplayer.AsyncWorldTime.randState}");
                                         foreach (var map in Find.Maps)
@@ -253,7 +269,8 @@ namespace Multiplayer.Client
 
             void LogError(string str)
             {
-                if (categoryNeedsAnnouncement) {
+                if (categoryNeedsAnnouncement)
+                {
                     Log.Message($"Multiplayer :: {category}");
                 }
                 Multiplayer.LoadingError(str);
@@ -267,19 +284,22 @@ namespace Multiplayer.Client
                 try
                 {
                     harmony.PatchMeasure(original, prefix, postfix, transpiler, finalizer);
-                } catch (Exception e) {
+                }
+                catch (Exception e)
+                {
                     LogError($"FAIL: {original.DeclaringType.FullName}:{original.Name} with {e}");
                 }
             }
 
             SetCategory("Annotated patches");
 
-            Assembly.GetCallingAssembly().GetTypes().Do(type => {
+            Assembly.GetCallingAssembly().GetTypes().Do(type =>
+            {
                 // EarlyPatches are handled in MultiplayerMod.EarlyPatches
                 if (type.IsDefined(typeof(EarlyPatchAttribute))) return;
 
                 var harmonyAttributes = HarmonyMethodExtensions.GetFromType(type);
-			    if (harmonyAttributes is null || harmonyAttributes.Count == 0) return;
+                if (harmonyAttributes is null || harmonyAttributes.Count == 0) return;
 
                 try
                 {

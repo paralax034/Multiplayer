@@ -41,20 +41,88 @@ public static class MainTabWindow_QuestsDoRowPatch
     }
 }
 
+/// <summary>
+/// Filters quest entries in the Quests UI tab so players only see quests belonging to their faction unless God Mode is enabled.
+/// </summary>
 [HarmonyPatch(typeof(MainTabWindow_Quests), nameof(MainTabWindow_Quests.ShouldListNow))]
 public static class MainTabWindow_QuestsShouldListNowPatch
 {
-    static bool Prefix(Quest quest, ref bool __result)
+    public static bool Prefix(MainTabWindow_Quests __instance, Quest quest, ref bool __result)
     {
-        if (Multiplayer.Client != null && Multiplayer.settings.hideOtherPlayersQuests)
+        if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction)
+            return true;
+
+        // Allow developers and admins to inspect all quests
+        if (DebugSettings.godMode || __instance.showAll)
+            return true;
+
+        // Hide quests associated with an opposing player faction
+        if (quest.TryGetPlayerFaction(out Faction questFaction))
         {
-            Faction playerFaction;
-            if (quest.TryGetPlayerFaction(out playerFaction) && playerFaction != Faction.OfPlayer)
+            var myFaction = Multiplayer.RealPlayerFaction;
+            if (myFaction != null && questFaction != null && questFaction != myFaction)
             {
                 __result = false;
                 return false;
             }
         }
+
+        return true;
+    }
+}
+
+/// <summary>
+/// Blocks player clients from accepting quests assigned to a different player colony.
+/// </summary>
+[HarmonyPatch(typeof(QuestUtility), nameof(QuestUtility.CanAcceptQuest))]
+public static class QuestUtilityCanAcceptQuestPatch
+{
+    public static void Postfix(Quest quest, ref AcceptanceReport __result)
+    {
+        if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction)
+            return;
+
+        if (DebugSettings.godMode)
+            return;
+
+        if (!__result.Accepted)
+            return;
+
+        if (quest.TryGetPlayerFaction(out Faction questFaction))
+        {
+            var myFaction = Multiplayer.RealPlayerFaction;
+            if (myFaction != null && questFaction != null && questFaction != myFaction)
+            {
+                __result = new AcceptanceReport("MpCannotAcceptOtherPlayerQuest".Translate(questFaction.Name));
+            }
+        }
+    }
+}
+
+/// <summary>
+/// Prevents clients from dismissing or cancelling quests belonging to other player factions.
+/// </summary>
+[HarmonyPatch(typeof(MainTabWindow_Quests), nameof(MainTabWindow_Quests.DoDismissButton))]
+public static class MainTabWindow_Quests_DoDismissButton_Patch
+{
+    public static bool Prefix(MainTabWindow_Quests __instance)
+    {
+        if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction)
+            return true;
+
+        if (DebugSettings.godMode)
+            return true;
+
+        var quest = __instance.selected;
+        if (quest != null && quest.TryGetPlayerFaction(out Faction questFaction))
+        {
+            var myFaction = Multiplayer.RealPlayerFaction;
+            if (myFaction != null && questFaction != null && questFaction != myFaction)
+            {
+                return false;
+            }
+        }
+
         return true;
     }
 }
@@ -128,34 +196,48 @@ public static class MainTabWindow_QuestsDoRewardsPrefsButtonPatch
     }
 }
 
+/// <summary>
+/// Replaces Find.Maps in ColonistBar recaching with a zero-allocation map filter.
+/// </summary>
 [HarmonyPatch(typeof(ColonistBar), nameof(ColonistBar.CheckRecacheEntries))]
 public static class ColonistBarCheckRecacheEntriesPatch
 {
-    static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> insts)
+    private static readonly MethodInfo Maps = AccessTools.PropertyGetter(typeof(Find), nameof(Find.Maps));
+    private static readonly MethodInfo FilteredMaps = AccessTools.Method(typeof(ColonistBarCheckRecacheEntriesPatch), nameof(GetFilteredMaps));
+
+    static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
     {
-        var findMapsGetter = AccessTools.PropertyGetter(typeof(Find), nameof(Find.Maps));
-        foreach (var inst in insts)
+        foreach (var instruction in instructions)
         {
-            if (inst.Calls(findMapsGetter))
-            {
-                yield return new CodeInstruction(OpCodes.Call,
-                    AccessTools.Method(typeof(ColonistBarCheckRecacheEntriesPatch), nameof(GetFilteredMaps)));
-            }
-            else
-            {
-                yield return inst;
-            }
+            if (instruction.Calls(Maps))
+                instruction.operand = FilteredMaps;
+
+            yield return instruction;
         }
     }
 
+    private static readonly List<Map> tmpFilteredMaps = new(8);
+
+    /// <summary>
+    /// Returns only maps containing active colonists or owned by the player, using reusable buffers instead of LINQ Where.
+    /// </summary>
     public static IEnumerable<Map> GetFilteredMaps()
     {
         if (Multiplayer.Client == null || !Multiplayer.settings.hideOtherPlayersInColonistBar)
             return Find.Maps;
 
-        return Find.Maps.Where(map =>
-            map.mapPawns.FreeColonistsSpawned.Any() ||
-            map.Parent?.Faction == Faction.OfPlayer);
+        tmpFilteredMaps.Clear();
+        var maps = Find.Maps;
+        for (int i = 0; i < maps.Count; i++)
+        {
+            var map = maps[i];
+            if (map.mapPawns.FreeColonistsSpawned.Count > 0 || map.Parent?.Faction == Faction.OfPlayer)
+            {
+                tmpFilteredMaps.Add(map);
+            }
+        }
+
+        return tmpFilteredMaps;
     }
 }
 
@@ -456,9 +538,24 @@ static class PawnIsColonistPatch
         }
     }
 
+    /// <summary>
+    /// High-performance colonist check. Evaluated tens of thousands of times per second at 4x speed.
+    /// Fast-paths simulation contexts before evaluating player faction properties.
+    /// </summary>
     static bool FactionIsPlayer(Faction f)
     {
-        return f == Find.FactionManager.OfPlayer;
+        if (f == null) return false;
+
+        // In simulation contexts (ticking maps, executing commands, sim long events), all player colonies are valid colonists
+        if (AsyncTimeComp.tickingMap != null || AsyncWorldTimeComp.tickingWorld ||
+            TickPatch.currentExecutingCmdType != null || Patches.SimLongEventContext.InSimulation)
+        {
+            return f.IsPlayer;
+        }
+
+        // Outside simulation (UI render/inspection loops), restrict to the local player's faction
+        Faction myFaction = Multiplayer.RealPlayerFaction ?? Find.FactionManager.OfPlayer;
+        return f == myFaction;
     }
 }
 
@@ -634,31 +731,305 @@ static class TakeToBedGuestFactionPatch
 }
 
 
+/// <summary>
+/// Comprehensive security utility for resolving faction ownership of Things, Pawns, Prisoners, Corpses, and Map-level events.
+/// </summary>
+public static class LetterSecurityUtility
+{
+    /// <summary>
+    /// Resolves target affiliation for onscreen messages and audio alerts.
+    /// Handles colonists, prisoners (via HostFaction), corpses, and map-level weather conditions.
+    /// </summary>
+    public static bool IsTargetForFaction(LookTargets lookTargets, Faction faction)
+    {
+        if (faction == null) return true;
+        if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction) return true;
+
+        // Fallback for map-level condition alerts without explicit targets (e.g. Flashstorm, Toxic Fallout)
+        if (lookTargets?.targets == null || lookTargets.targets.Count == 0)
+        {
+            var mapContext = Multiplayer.MapContext;
+            if (mapContext?.ParentFaction is { IsPlayer: true } mapFaction)
+            {
+                return mapFaction == faction;
+            }
+
+            return true;
+        }
+
+        bool hasAnyPlayerAffiliation = false;
+        bool hasAnyThingTarget = false;
+        var targets = lookTargets.targets;
+
+        for (int i = 0; i < targets.Count; i++)
+        {
+            var target = targets[i];
+            Faction targetFaction = null;
+
+            if (target.HasThing && target.Thing != null)
+            {
+                hasAnyThingTarget = true;
+                var thing = target.Thing;
+
+                // 1. Direct colonist or player structure ownership
+                if (thing.Faction is { IsPlayer: true } tf)
+                {
+                    targetFaction = tf;
+                }
+                // 2. Prisoner check: prisoner faction is enemy, but HostFaction is the captor
+                else if (thing is Pawn pawn && pawn.HostFaction is { IsPlayer: true } hostFac)
+                {
+                    targetFaction = hostFac;
+                }
+                // 3. Corpse check: resolve inner pawn colonist or prisoner status
+                else if (thing is Corpse corpse && corpse.InnerPawn != null)
+                {
+                    if (corpse.InnerPawn.Faction is { IsPlayer: true } ctf)
+                        targetFaction = ctf;
+                    else if (corpse.InnerPawn.HostFaction is { IsPlayer: true } chf)
+                        targetFaction = chf;
+                }
+                // 4. Physical map placement
+                else if (thing.Map?.ParentFaction is { IsPlayer: true } mf)
+                {
+                    targetFaction = mf;
+                }
+                else if (thing.MapHeld?.ParentFaction is { IsPlayer: true } mhf)
+                {
+                    targetFaction = mhf;
+                }
+                // 5. Despawned tile tracking
+                else if (thing.Tile.Valid)
+                {
+                    var maps = Find.Maps;
+                    for (int m = 0; m < maps.Count; m++)
+                    {
+                        var map = maps[m];
+                        if (map.Tile == thing.Tile && map.ParentFaction is { IsPlayer: true } mapFac)
+                        {
+                            targetFaction = mapFac;
+                            break;
+                        }
+                    }
+
+                    if (targetFaction == null && Find.WorldObjects?.Settlements != null)
+                    {
+                        var settlements = Find.WorldObjects.Settlements;
+                        for (int s = 0; s < settlements.Count; s++)
+                        {
+                            var settlement = settlements[s];
+                            if (settlement.Tile == thing.Tile && settlement.Faction is { IsPlayer: true } setFac)
+                            {
+                                targetFaction = setFac;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            // World object targets (caravans, sites, settlements)
+            else if (target.HasWorldObject && target.WorldObject != null)
+            {
+                var worldObj = target.WorldObject;
+                if (worldObj.Faction is { IsPlayer: true } wf)
+                {
+                    targetFaction = wf;
+                }
+                else if (worldObj is Caravan caravan && caravan.Faction is { IsPlayer: true } cf)
+                {
+                    targetFaction = cf;
+                }
+            }
+            // Target points directly to a cell on a player-owned map
+            else if (target.Map?.ParentFaction is { IsPlayer: true } cellMapFac)
+            {
+                targetFaction = cellMapFac;
+            }
+
+            if (targetFaction != null)
+            {
+                hasAnyPlayerAffiliation = true;
+                if (targetFaction == faction)
+                    return true;
+            }
+        }
+
+        if (hasAnyThingTarget && !hasAnyPlayerAffiliation)
+        {
+            return false;
+        }
+
+        return !hasAnyPlayerAffiliation;
+    }
+
+    /// <summary>
+    /// Evaluates letter visibility using quest context, targets (with prisoner/corpse resolution), and MapContext fallback.
+    /// </summary>
+    public static bool IsLetterForFaction(Letter let, Faction faction)
+    {
+        if (faction == null) return true;
+        if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction) return true;
+        if (let == null) return false;
+
+        // Quests have explicit faction bounds
+        if (let is ChoiceLetter choiceLetter && choiceLetter.quest != null)
+        {
+            if (choiceLetter.quest.TryGetPlayerFaction(out Faction questFaction))
+                return questFaction == faction;
+        }
+
+        // Target locations override generic relatedFaction
+        if (let.lookTargets?.targets != null && let.lookTargets.targets.Count > 0)
+        {
+            return IsTargetForFaction(let.lookTargets, faction);
+        }
+
+        // Direct faction association
+        if (let.relatedFaction is { IsPlayer: true } relatedFac)
+        {
+            return relatedFac == faction;
+        }
+
+        // Map context fallback for weather and ambient incidents
+        var mapContext = Multiplayer.MapContext;
+        if (mapContext?.ParentFaction is { IsPlayer: true } mapFaction)
+        {
+            return mapFaction == faction;
+        }
+
+        return true;
+    }
+}
+
+/// <summary>
+/// Silences camera audio cue for incoming letters belonging to other factions.
+/// </summary>
 [HarmonyPatch(typeof(LetterStack), nameof(LetterStack.ReceiveLetter), typeof(Letter), typeof(string), typeof(int), typeof(bool))]
 static class LetterStackReceiveSoundOnlyMyFaction
 {
-    private static MethodInfo PlayOneShotOnCamera =
-        typeof(SoundStarter).GetMethod(nameof(SoundStarter.PlayOneShotOnCamera));
+    private static readonly MethodInfo PlayOneShotOnCamera =
+        AccessTools.Method(typeof(SoundStarter), nameof(SoundStarter.PlayOneShotOnCamera), new[] { typeof(SoundDef), typeof(Map) });
+    private static readonly MethodInfo ReplacementMethod =
+        AccessTools.Method(typeof(LetterStackReceiveSoundOnlyMyFaction), nameof(PlaySoundReplacement));
 
     static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> insts)
     {
         foreach (var inst in insts)
         {
-            if (inst.operand as MethodInfo == PlayOneShotOnCamera)
-                yield return new CodeInstruction(
-                    OpCodes.Call,
-                    SymbolExtensions.GetMethodInfo((SoundDef s, Map m) => PlaySoundReplacement(s, m)));
+            if (inst.Calls(PlayOneShotOnCamera))
+            {
+                yield return new CodeInstruction(OpCodes.Ldarg_1); // Pass Letter argument
+                yield return new CodeInstruction(OpCodes.Call, ReplacementMethod);
+            }
             else
+            {
                 yield return inst;
+            }
         }
     }
 
-    static void PlaySoundReplacement(SoundDef sound, Map map)
+    static void PlaySoundReplacement(SoundDef sound, Map map, Letter let)
     {
-        // Letters are kept in every client's stack and only shown to their faction's players (see MultifactionLetters)
-        var letter = RecordLetterFaction.receiving;
-        if (letter != null ? MultifactionLetters.IsVisibleLocally(letter) : Multiplayer.RealPlayerFaction == Faction.OfPlayer)
+        if (sound == null) return;
+        if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction)
+        {
             sound.PlayOneShotOnCamera(map);
+            return;
+        }
+
+        if (LetterSecurityUtility.IsLetterForFaction(let, Multiplayer.RealPlayerFaction))
+        {
+            sound.PlayOneShotOnCamera(map);
+        }
+    }
+}
+
+/// <summary>
+/// Filters onscreen message display so notifications regarding other players' colonists or bases remain hidden.
+/// </summary>
+[HarmonyPatch(typeof(Messages), nameof(Messages.MessagesDoGUI))]
+static class MessagesDoGUIFilterPatch
+{
+    private static readonly FieldInfo LiveMessagesField = AccessTools.Field(typeof(Messages), "liveMessages");
+    private static readonly MethodInfo FilteredLiveMessagesMethod = AccessTools.Method(typeof(MessagesDoGUIFilterPatch), nameof(GetFilteredLiveMessages));
+
+    static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+    {
+        foreach (var ci in instructions)
+        {
+            if (ci.LoadsField(LiveMessagesField))
+            {
+                ci.opcode = OpCodes.Call;
+                ci.operand = FilteredLiveMessagesMethod;
+            }
+            yield return ci;
+        }
+    }
+
+    private static readonly List<Message> tmpFilteredMessages = new(16);
+
+    public static List<Message> GetFilteredLiveMessages()
+    {
+        var original = Messages.liveMessages;
+        if (Multiplayer.Client == null || Multiplayer.game == null || !Multiplayer.GameComp.multifaction)
+            return original;
+
+        tmpFilteredMessages.Clear();
+        var myFaction = Multiplayer.RealPlayerFaction;
+
+        for (int i = 0; i < original.Count; i++)
+        {
+            var msg = original[i];
+            if (LetterSecurityUtility.IsTargetForFaction(msg.lookTargets, myFaction))
+            {
+                tmpFilteredMessages.Add(msg);
+            }
+        }
+
+        return tmpFilteredMessages;
+    }
+}
+
+/// <summary>
+/// Suppresses audio beeps for messages belonging to other factions.
+/// </summary>
+[HarmonyPatch(typeof(Messages), nameof(Messages.Message), typeof(Message), typeof(bool))]
+static class MessagesSoundFilterPatch
+{
+    private static readonly MethodInfo PlayOneShotOnCamera =
+        AccessTools.Method(typeof(SoundStarter), nameof(SoundStarter.PlayOneShotOnCamera), new[] { typeof(SoundDef), typeof(Map) });
+    private static readonly MethodInfo ReplacementMethod =
+        AccessTools.Method(typeof(MessagesSoundFilterPatch), nameof(PlayMessageSoundReplacement));
+
+    static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> insts)
+    {
+        foreach (var inst in insts)
+        {
+            if (inst.Calls(PlayOneShotOnCamera))
+            {
+                yield return new CodeInstruction(OpCodes.Ldarg_0); // Pass Message argument
+                yield return new CodeInstruction(OpCodes.Call, ReplacementMethod);
+            }
+            else
+            {
+                yield return inst;
+            }
+        }
+    }
+
+    static void PlayMessageSoundReplacement(SoundDef sound, Map map, Message msg)
+    {
+        if (sound == null) return;
+        if (Multiplayer.Client == null || Multiplayer.game == null || !Multiplayer.GameComp.multifaction)
+        {
+            sound.PlayOneShotOnCamera(map);
+            return;
+        }
+
+        if (LetterSecurityUtility.IsTargetForFaction(msg.lookTargets, Multiplayer.RealPlayerFaction))
+        {
+            sound.PlayOneShotOnCamera(map);
+        }
     }
 }
 

@@ -121,7 +121,19 @@ namespace Multiplayer.Client
             var session = Multiplayer.session;
 
             var btnRect = new Rect(x, y, BtnWidth, BtnHeight);
-            var chatColor = session.players.Any(p => p.status == PlayerStatus.Desynced) ? "#ff5555" : "#dddddd";
+            // Evaluate desync status using indexed loop to avoid allocating LINQ enumerators on every GUI frame
+            bool hasDesynced = false;
+            var sessionPlayers = session.players;
+            for (int i = 0; i < sessionPlayers.Count; i++)
+            {
+                if (sessionPlayers[i].status == PlayerStatus.Desynced)
+                {
+                    hasDesynced = true;
+                    break;
+                }
+            }
+
+            var chatColor = hasDesynced ? "#ff5555" : "#dddddd";
             var hasUnread = session.hasUnread ? "*" : "";
             var chatLabel = $"{"MpChatButton".Translate()} <color={chatColor}>({session.players.Count})</color>{hasUnread}";
 

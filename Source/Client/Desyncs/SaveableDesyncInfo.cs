@@ -54,6 +54,14 @@ public class SaveableDesyncInfo(
 
             zip.AddEntry("local_metadata.txt", metadata.Result);
 
+            // Resolve host vs client trace streams symmetrically depending on host status
+            bool isHost = Multiplayer.LocalServer != null;
+            string hostTraces = isHost ? GetLocalTraces() : (hostInfo?.Traces ?? string.Empty);
+            string clientTraces = isHost ? (hostInfo?.Traces ?? GetRemoteTraces()) : GetLocalTraces();
+
+            var analysisReport = DesyncDiffAnalyzer.GenerateDiffReport(hostTraces, clientTraces, this);
+            zip.AddEntry("desync_analysis.txt", analysisReport);
+
             try
             {
                 replay.Wait();
@@ -62,7 +70,8 @@ public class SaveableDesyncInfo(
             {
                 if (e.InnerExceptions.SingleOrDefault(inner => inner is TaskCanceledException) == null) throw;
             }
-            if (replay.IsCompletedSuccessfully) {
+            if (replay.IsCompletedSuccessfully)
+            {
                 var replayFile = replay.Result;
                 zip.CreateEntryFromFile(replayFile.FullName, "replay.rwmts", CompressionLevel.NoCompression);
                 DeleteFileSilent(replayFile);
@@ -76,30 +85,39 @@ public class SaveableDesyncInfo(
         Log.Message($"Desync info writing took {watch.ElapsedMilliseconds}");
     }
 
-    private string GetLocalTraces()
+    /// <summary>
+    /// Formats local desync stacktrace hashes and frames into text for diffing and UI inspection.
+    /// Uses Math.Min to prevent IndexOutOfRangeException if hash and trace counts diverge.
+    /// </summary>
+    public string GetLocalTraces()
     {
-        var traceMessage = "";
-        var localCount = local.desyncStackTraceHashes.Count;
-        var remoteCount = remote.desyncStackTraceHashes.Count;
-        int count = Math.Min(localCount, remoteCount);
+        if (local == null) return string.Empty;
 
-        if (diffAt == -1)
+        var builder = new StringBuilder();
+        var count = Math.Min(local.desyncStackTraceHashes.Count, local.desyncStackTraces.Count);
+        for (var i = 0; i < count; i++)
         {
-            if (count == 0)
-            {
-                return $"No traces (remote: {remoteCount}, local: {localCount})";
-            }
-
-            traceMessage = "Note: trace hashes are equal between local and remote\n\n";
-        }
-        else if (!diffAtFound)
-        {
-            traceMessage = "Note: traces differ in amount, but the existing ones are equal. This means that a tick" +
-                           " has ended sooner on one of the connection sides\n\n";
+            builder.Append(i).Append(' ').Append(local.desyncStackTraces[i]).Append("\n\n");
         }
 
-        traceMessage += local.GetFormattedStackTracesForRange(diffAt);
-        return traceMessage;
+        return builder.ToString();
+    }
+
+    /// <summary>
+    /// Formats remote desync stacktrace hashes and frames into text when available in the peer opinion.
+    /// </summary>
+    public string GetRemoteTraces()
+    {
+        if (remote == null) return string.Empty;
+
+        var builder = new StringBuilder();
+        var count = Math.Min(remote.desyncStackTraceHashes.Count, remote.desyncStackTraces.Count);
+        for (var i = 0; i < count; i++)
+        {
+            builder.Append(i).Append(' ').Append(remote.desyncStackTraces[i]).Append("\n\n");
+        }
+
+        return builder.ToString();
     }
 
     private string GetDesyncDetails()

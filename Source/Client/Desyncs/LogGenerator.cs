@@ -17,6 +17,17 @@ namespace Multiplayer.Client
         // The start has the setup (mods, patching errors), the end the desync itself
         private const int HeadLogLineCount = 2000;
 
+        /// <summary>
+        /// Pre-compiled patterns for log redaction to avoid rebuilding AST/NFA state machines on megabyte payloads.
+        /// </summary>
+        private static readonly Regex NonPlatformAssemblyRegex = new(@"Non platform assembly:.+\n", RegexOptions.Compiled);
+        private static readonly Regex PlatformAssemblyRegex = new(@"Platform assembly: .+\n", RegexOptions.Compiled);
+        private static readonly Regex FallbackHandlerRegex = new(@"Fallback handler could not load library.+\n", RegexOptions.Compiled);
+        private static readonly Regex CompletedReloadRegex = new(@"- Completed reload, in [\d\. ]+ seconds\n", RegexOptions.Compiled);
+        private static readonly Regex UnloadTimeRegex = new(@"UnloadTime: [\d\. ]+ ms\n", RegexOptions.Compiled);
+        private static readonly Regex TouchSupportRegex = new(@"<RI> Initialized touch support\.\r?\n", RegexOptions.Compiled);
+        private static readonly Regex BuildslaveRegex = new(@"\(Filename: [A-Z]:[/\\]buildslave.+\n", RegexOptions.Compiled);
+
         internal static string PrepareLogData()
         {
             try
@@ -38,7 +49,7 @@ namespace Multiplayer.Client
 
                 return logSection;
             }
-            catch(Exception e)
+            catch (Exception e)
             {
                 return $"Failed to generate log data: \n{e}";
             }
@@ -52,19 +63,26 @@ namespace Multiplayer.Client
         private static string TrimExcessLines(string log) =>
             log.KeepHeadAndTailLines(HeadLogLineCount, MaxLogLineCount - HeadLogLineCount);
 
+        /// <summary>
+        /// Cleans uninformative Unity runtime lines. Replaces constant substrings via string.Replace to bypass regex engine.
+        /// </summary>
         private static string RedactUselessLines(string log)
         {
-            log = Regex.Replace(log, "Non platform assembly:.+\n", "");
-            log = Regex.Replace(log, "Platform assembly: .+\n", "");
-            log = Regex.Replace(log, "Fallback handler could not load library.+\n", "");
-            log = Regex.Replace(log, "- Completed reload, in [\\d\\. ]+ seconds\n", "");
-            log = Regex.Replace(log, "UnloadTime: [\\d\\. ]+ ms\n", "");
-            log = Regex.Replace(log, "<RI> Initializing input\\.\r\n", "");
-            log = Regex.Replace(log, "<RI> Input initialized\\.\r\n", "");
-            log = Regex.Replace(log, "<RI> Initialized touch support\\.\r\n", "");
-            log = Regex.Replace(log, "\\(Filename: C:/buildslave.+\n", "");
-            log = Regex.Replace(log, "\\(Filename: C:\\\\buildslave.+\n", "");
-            log = Regex.Replace(log, "\n \n", "\n");
+            log = NonPlatformAssemblyRegex.Replace(log, "");
+            log = PlatformAssemblyRegex.Replace(log, "");
+            log = FallbackHandlerRegex.Replace(log, "");
+            log = CompletedReloadRegex.Replace(log, "");
+            log = UnloadTimeRegex.Replace(log, "");
+            log = TouchSupportRegex.Replace(log, "");
+            log = BuildslaveRegex.Replace(log, "");
+
+            // Use direct string replace for literal sequences instead of invoking regex engines
+            log = log.Replace("<RI> Initializing input.\r\n", "");
+            log = log.Replace("<RI> Initializing input.\n", "");
+            log = log.Replace("<RI> Input initialized.\r\n", "");
+            log = log.Replace("<RI> Input initialized.\n", "");
+            log = log.Replace("\n \n", "\n");
+
             return log;
         }
 
@@ -148,8 +166,8 @@ namespace Multiplayer.Client
 
             if (startIndex < 0 || endIndex < 0) return result;
 
-            var logTail = original.Substring(endIndex);
-            result = original.Substring(0, startIndex + redactStart.Length);
+            var logTail = original[endIndex..];
+            result = original[..(startIndex + redactStart.Length)];
             result += replacement;
             result += logTail;
 

@@ -9,7 +9,10 @@ namespace Multiplayer.Client
 {
     public class DesyncedWindow : Window
     {
-        const int NumButtons = 5;
+        /// <summary>
+        /// Expanded button count to accommodate the forensic diff analysis tool
+        /// </summary>
+        const int NumButtons = 6;
         const float ButtonsWidth = 120 * NumButtons + 10 * (NumButtons - 1);
 
         public override Vector2 InitialSize => new(30 + 130 * NumButtons, 110);
@@ -85,6 +88,22 @@ namespace Multiplayer.Client
             );
             if (openDesyncsFolder)
                 ShellOpenDirectory.Execute(Multiplayer.DesyncsDir);
+            x += 120 + 10;
+
+            // Forensic Diff Report Window Launcher with symmetric Host/Client resolution
+            if (Widgets.ButtonText(new Rect(x, 0, 120, 35), "MpDesyncAnalysis".Translate()))
+            {
+                bool isHost = Multiplayer.LocalServer != null;
+                string hostTraces = isHost ? desyncInfo.GetLocalTraces() : (hostInfo?.Traces ?? string.Empty);
+                string clientTraces = isHost ? (hostInfo?.Traces ?? desyncInfo.GetRemoteTraces()) : desyncInfo.GetLocalTraces();
+
+                string report = DesyncDiffAnalyzer.GenerateDiffReport(hostTraces, clientTraces, desyncInfo);
+                var reportWindow = new DebugTextWindow(report, UI.screenWidth * 0.85f, UI.screenHeight * 0.85f)
+                {
+                    layer = WindowLayer.Super
+                };
+                Find.WindowStack.Add(reportWindow);
+            }
             x += 120 + 10;
 
             if (Widgets.ButtonText(new Rect(x, 0, 120, 35), "Quit".Translate()))

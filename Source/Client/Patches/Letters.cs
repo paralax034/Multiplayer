@@ -24,12 +24,22 @@ namespace Multiplayer.Client.Patches
         public static void RecordReceivingFaction(Letter let)
         {
             // Negative ids are interface-only letters
-            if (!Active || let == null || let.ID < 0 || Faction.OfPlayer == null) return;
+            if (!Active || let == null || let.ID < 0) return;
 
             // Delayed letters are received again later from the queue (in another context), keep the first faction
             var letterFactions = Multiplayer.game.worldComp?.letterFactions;
-            if (letterFactions != null && !letterFactions.ContainsKey(let.ID))
-                letterFactions[let.ID] = Faction.OfPlayer.loadID;
+            if (letterFactions == null || letterFactions.ContainsKey(let.ID))
+                return;
+
+            // Priority: explicit related faction -> active player context -> map owner fallback
+            Faction receivingFaction = let.relatedFaction is { IsPlayer: true } rf
+                ? rf
+                : (Faction.OfPlayer != null && Faction.OfPlayer != Multiplayer.WorldComp?.spectatorFaction
+                    ? Faction.OfPlayer
+                    : Multiplayer.MapContext?.ParentFaction);
+
+            if (receivingFaction != null)
+                letterFactions[let.ID] = receivingFaction.loadID;
         }
 
         public static bool IsVisibleLocally(Letter let)
@@ -37,13 +47,22 @@ namespace Multiplayer.Client.Patches
             if (!Active || let == null) return true;
 
             var worldComp = Multiplayer.game.worldComp;
-            if (worldComp == null || !worldComp.letterFactions.TryGetValue(let.ID, out var factionId))
-                return true;
+            if (worldComp == null) return true;
 
-            // Letters received in a spectator context (e.g. world ticks) aren't specific to a player faction
-            return factionId == Multiplayer.RealPlayerFaction?.loadID ||
-                   factionId == worldComp.spectatorFaction?.loadID ||
-                   Find.FactionManager.GetById(factionId) == null;
+            // Check recorded ID map first
+            if (worldComp.letterFactions.TryGetValue(let.ID, out var factionId))
+            {
+                var myFactionId = Multiplayer.RealPlayerFaction?.loadID;
+                if (factionId == myFactionId)
+                    return true;
+
+                // If recorded under a specific other player faction, strictly hide
+                if (Find.FactionManager.GetById(factionId) is { IsPlayer: true })
+                    return false;
+            }
+
+            // Fall back to comprehensive target and prisoner inspection
+            return LetterSecurityUtility.IsLetterForFaction(let, Multiplayer.RealPlayerFaction);
         }
     }
 

@@ -22,7 +22,7 @@ namespace Multiplayer.Client
 {
     public static class Extensions
     {
-        private static Regex methodNameCleaner = new Regex(@"(\?[0-9\-]+)");
+        private static readonly Regex methodNameCleaner = new(@"(\?[0-9\-]+)", RegexOptions.Compiled);
 
         public static Map GetMap(this ScheduledCommand cmd)
         {
@@ -111,7 +111,8 @@ namespace Multiplayer.Client
         public static int Hash(this StackTrace trace)
         {
             var traceToHash = new StringBuilder();
-            for (int i = 0; i < trace.FrameCount; i++) {
+            for (int i = 0; i < trace.FrameCount; i++)
+            {
                 var method = trace.GetFrame(i).GetMethod();
                 traceToHash.Append(methodNameCleaner.Replace(method.ToString(), "") + "\n");
             }
@@ -282,7 +283,7 @@ namespace Multiplayer.Client
             watch.Stop();
             var took = watch.ElapsedMillisDouble() - prev;
             // if (took > 5)
-                // Log.Message($"{took} ms: Patching {original.MethodDesc()}");
+            // Log.Message($"{took} ms: Patching {original.MethodDesc()}");
             return result;
         }
 
@@ -293,16 +294,35 @@ namespace Multiplayer.Client
         }
 
         /// <summary>
-        /// Returns an enumerable as a string, joined by a separator string. By default null values appear as an empty string.
+        /// Concatenates an enumerable into a string separated by a delimiter.
+        /// Bypasses IEnumerator heap allocations via indexed for-loop when the collection implements IList.
         /// </summary>
-        /// <param name="list">A list of elements to string together</param>
-        /// <param name="separator">A string to inset between elements</param>
-        /// <param name="explicitNullValues">If true, null elements will appear as "[null]"</param>
+        /// <param name="list">Collection to join.</param>
+        /// <param name="separator">String delimiter between elements.</param>
+        /// <param name="explicitNullValues">When true, null elements are output as "[null]".</param>
+        /// <returns>Formatted string, or empty string if collection is null or empty.</returns>
         public static string Join(this IEnumerable list, string separator, bool explicitNullValues = false)
         {
             if (list == null) return "";
             var builder = new StringBuilder();
             var useSeparator = false;
+
+            // Fast-path: eliminate enumerator boxing and allocation for indexed lists
+            if (list is IList iList)
+            {
+                for (int i = 0; i < iList.Count; i++)
+                {
+                    var elem = iList[i];
+                    if (useSeparator) builder.Append(separator);
+                    useSeparator = true;
+                    if (elem != null || explicitNullValues)
+                    {
+                        builder.Append(elem != null ? elem.ToString() : "[null]");
+                    }
+                }
+                return builder.ToString();
+            }
+
             foreach (var elem in list)
             {
                 if (useSeparator) builder.Append(separator);

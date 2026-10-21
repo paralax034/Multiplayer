@@ -19,7 +19,16 @@ namespace Multiplayer.Client
         private static string factionNameTextField;
         private static Color factionColor = new Color32(0x00, 0xBC, 0xD8, 255);
         private static bool setupNextMapFromTickZero;
-        private static ScenarioDef chosenScenario = ScenarioDefOf.Crashlanded;
+        private static ScenarioDef chosenScenarioInt;
+
+        /// <summary>
+        /// Resolves the selected starting scenario with a safe fallback to prevent null references during early mod init.
+        /// </summary>
+        private static ScenarioDef ChosenScenario
+        {
+            get => chosenScenarioInt ??= ScenarioDefOf.Crashlanded ?? DefDatabase<ScenarioDef>.GetNamedSilentFail("Crashlanded");
+            set => chosenScenarioInt = value;
+        }
 
         private static Vector2 joinFactionScroll;
 
@@ -110,7 +119,7 @@ namespace Multiplayer.Client
                         new ClientSetFactionPacket(Multiplayer.session.playerId, playerFaction.loadID));
                 }
 
-                Rect locateButton = new Rect(entryRect.xMax - 110, entryRect.y+7, 24, 24);
+                Rect locateButton = new Rect(entryRect.xMax - 110, entryRect.y + 7, 24, 24);
                 if (Widgets.ButtonImage(locateButton, TexButton.OpenInspector))
                 {
                     var factionHomes = Find.Maps.Where(m => m.ParentFaction == playerFaction).ToList();
@@ -232,7 +241,6 @@ namespace Multiplayer.Client
             using (MpStyle.Set(GameFont.Small))
                 Widgets.Label(colorPreviewlabelRect, "MpFactionColor".Translate());
 
-
             Widgets.DrawBoxSolid(colorPreviewRect, factionColor);
             Widgets.DrawBox(colorPreviewRect);
             Widgets.DrawHighlightIfMouseover(colorPreviewRect);
@@ -242,7 +250,7 @@ namespace Multiplayer.Client
                 Find.WindowStack.Add(new Dialog_ChooseFactionColor(color =>
                 {
                     factionColor = color;
-                },factionColor));
+                }, factionColor));
             }
             viewRect.yMin += rowHeight + spacing;
             // END Faction Color Picker
@@ -310,7 +318,7 @@ namespace Multiplayer.Client
                 OpenScenarioChooser();
 
             Text.Anchor = TextAnchor.MiddleCenter;
-            Widgets.Label(scenarioRect, $"{chosenScenario?.label ?? Find.Scenario.name}");
+            Widgets.Label(scenarioRect, $"{ChosenScenario?.label ?? Find.Scenario.name}");
             Text.Anchor = TextAnchor.UpperLeft;
 
             viewRect.yMin += rowHeight + spacing;
@@ -370,10 +378,6 @@ namespace Multiplayer.Client
             List<Pawn> startingPawns = new List<Pawn>();
             FactionCreationData factionCreationDto = new FactionCreationData();
 
-            // OldComment: This is to force a sync
-            // TODO: Make this clearer without a needed comment
-            // LookUp Multiplayer.InInterface && Multiplayer.ShouldSync
-
             Current.programStateInt = ProgramState.Playing;
 
             try
@@ -388,7 +392,7 @@ namespace Multiplayer.Client
                 factionCreationDto.factionName = factionNameTextField;
                 factionCreationDto.factionColor = factionColor;
                 factionCreationDto.startingTile = Find.WorldInterface.SelectedTile;
-                factionCreationDto.scenarioDef = chosenScenario;
+                factionCreationDto.scenarioDef = ChosenScenario;
                 factionCreationDto.chooseIdeoInfo = chooseIdeoInfo;
                 factionCreationDto.generateMap = generateMap;
                 factionCreationDto.startingPossessions = GetStartingPossessions(startingPawns);
@@ -406,22 +410,23 @@ namespace Multiplayer.Client
         {
             Find.WindowStack.Add(new Page_SelectScenario_Multifaction
             {
-                curScen = chosenScenario?.scenario,
+                curScen = ChosenScenario?.scenario,
                 onScenChosen = chosenScen =>
                 {
                     var selectedDef = DefDatabase<ScenarioDef>.AllDefsListForReading.Find(def => def.scenario == chosenScen);
 
                     if (selectedDef != null)
-                        chosenScenario = selectedDef;
+                        ChosenScenario = selectedDef;
                 }
             });
         }
+
         private static void OpenConfigurationPages()
         {
             var gameConfigurationPages = new List<Page>();
             Page_ChooseIdeo_Multifaction ideologyConfigPage = null;
             Page_ConfigureStartingPawns pawnConfigPage = null;
-            var scenario = chosenScenario?.scenario ?? Find.Scenario;
+            var scenario = ChosenScenario?.scenario ?? Find.Scenario;
 
             InitializeDataForGameConfigurationPages();
 
@@ -443,6 +448,7 @@ namespace Multiplayer.Client
 
             Find.WindowStack.Add(PageUtility.StitchedPages(gameConfigurationPages));
         }
+
         // Find.Scenario is shared game state the simulation reads (Scenario.TickScenario, stat factors, disabled
         // incidents, ...), so the configuration pages only apply their scenario while their own code runs
         internal static MpScope UseScenario(Scenario scenario)

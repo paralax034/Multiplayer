@@ -7,6 +7,7 @@ using RimWorld;
 using UnityEngine;
 using Verse;
 using System.Collections.Generic;
+using RimWorld.Planet;
 
 namespace Multiplayer.Client.DebugUi
 {
@@ -33,38 +34,62 @@ namespace Multiplayer.Client.DebugUi
         private const float LineHeight = 18f;
         private const float LabelColumnWidth = 0.5f;
 
+        private const int SyncDebugPanelImmediateWindowId = 98723412;
+        private const float PanelDefaultX = 100f;
+
+        private static readonly HarmonyLib.AccessTools.FieldRef<WorldPawns, HashSet<Pawn>> PawnsAliveRef =
+            HarmonyLib.AccessTools.FieldRefAccess<WorldPawns, HashSet<Pawn>>("pawnsAlive");
+
         /// <summary>
-        /// Main entry point for the enhanced debug panel
+        /// Renders the enhanced debug panel. Elevates to WindowLayer.Super when DesyncedWindow is active to bypass modal input absorbers.
         /// </summary>
         public static float DoSyncDebugPanel(float y)
         {
-            // Safety checks
-            if (Multiplayer.session == null || !MpVersion.IsDebug || !Multiplayer.ShowDevInfo || Multiplayer.WriterLog == null) return 0;
+            if (!Multiplayer.ShowDevInfo || Current.ProgramState != ProgramState.Playing)
+                return 0f;
 
             try
             {
-                float x = 100f;
+                float x = PanelDefaultX;
                 float panelHeight = isExpanded ? VisibleExpandedHeight : HeaderHeight;
-
                 Rect panelRect = new(x, y, PanelWidth, panelHeight);
 
-                // Draw panel background
-                Widgets.DrawBoxSolid(panelRect, new Color(0f, 0f, 0f, 0.7f));
-                Widgets.DrawBox(panelRect);
-
-                if (isExpanded)
-                    DrawExpandedPanel(panelRect);
+                // Elevate above DesyncedWindow's modal dimming and full-screen click absorber
+                if (Find.WindowStack != null && Find.WindowStack.IsOpen<DesyncedWindow>())
+                {
+                    Find.WindowStack.ImmediateWindow(
+                        SyncDebugPanelImmediateWindowId,
+                        panelRect,
+                        WindowLayer.Super,
+                        () => DrawPanelContents(panelRect.AtZero()),
+                        doBackground: false,
+                        absorbInputAroundWindow: false,
+                        shadowAlpha: 0f
+                    );
+                }
                 else
-                    DrawHeader(panelRect);
+                {
+                    DrawPanelContents(panelRect);
+                }
 
                 return panelHeight + Margin;
             }
             catch (Exception ex)
             {
-                // Fallback in case of any errors - don't crash the game
-                Log.Error($"SyncDebugPanel error: {ex.Message}");
-                return 0;
+                Log.ErrorOnce($"Exception drawing SyncDebugPanel: {ex}", 0x2A4F91);
+                return 0f;
             }
+        }
+
+        private static void DrawPanelContents(Rect rect)
+        {
+            Widgets.DrawBoxSolid(rect, new Color(0f, 0f, 0f, 0.7f));
+            Widgets.DrawBox(rect);
+
+            if (isExpanded)
+                DrawExpandedPanel(rect);
+            else
+                DrawHeader(rect);
         }
 
         /// <summary>
@@ -294,7 +319,7 @@ namespace Multiplayer.Client.DebugUi
                     float sampleCount = PerformanceRecorder.MaxSampleCountSetting;
                     var sampleCountLabelRect = new Rect(x, currentY, width, lineHeight);
                     Widgets.Label(sampleCountLabelRect, $"Max samples: {sampleCount}");
-                    currentY+= lineHeight + 1;
+                    currentY += lineHeight + 1;
 
                     var sampleCountSliderRect = new Rect(x, currentY, width, lineHeight);
                     sampleCount = Widgets.HorizontalSlider(sampleCountSliderRect, sampleCount, 1000f, 500000f, roundTo: 0);
@@ -572,8 +597,11 @@ namespace Multiplayer.Client.DebugUi
                 TickPatch.tickUntil - TickPatch.Timer >= 7 ? TickPatch.serverTimePerTick * 0.8f :
                 TickPatch.serverTimePerTick;
 
+            // Direct O(1) count from internal HashSet to prevent instantiating AllPawnsAliveOrDead on every GUI frame
+            int alivePawnsCount = Find.WorldPawns != null ? (PawnsAliveRef(Find.WorldPawns)?.Count ?? 0) : 0;
+
             DebugLine[] memoryLines = [
-                new("World Pawns:", $"{Find.WorldPawns.AllPawnsAliveOrDead.Count}", Color.white),
+                new("World Pawns:", $"{alivePawnsCount}", Color.white),
                 new("Pool Free Items:", $"{SimplePool<StackTraceLogItemRaw>.FreeItemsCount}", Color.white),
                 new("Calc Server TPT:", $"{serverTpt:F1}ms", Color.white)
             ];
