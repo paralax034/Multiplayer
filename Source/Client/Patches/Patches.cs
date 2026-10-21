@@ -61,7 +61,7 @@ namespace Multiplayer.Client
     }
 
     [HarmonyPatch(typeof(Dialog_BillConfig), MethodType.Constructor)]
-    [HarmonyPatch(new[] {typeof(Bill_Production), typeof(IntVec3)})]
+    [HarmonyPatch(new[] { typeof(Bill_Production), typeof(IntVec3) })]
     public static class DialogPatch
     {
         static void Postfix(Dialog_BillConfig __instance)
@@ -435,10 +435,12 @@ namespace Multiplayer.Client
         {
             if (Multiplayer.Client == null) return true;
 
-            foreach(var part in Find.QuestManager.QuestsListForReading.SelectMany(q => q.parts).OfType<QuestPart_Choice>()) {
+            foreach (var part in Find.QuestManager.QuestsListForReading.SelectMany(q => q.parts).OfType<QuestPart_Choice>())
+            {
                 int index = part.choices.IndexOf(___localChoice);
 
-                if (index >= 0) {
+                if (index >= 0)
+                {
                     Choose(part, index);
                     return false;
                 }
@@ -610,6 +612,121 @@ namespace Multiplayer.Client
             }
 
             return true; // Execute normally
+        }
+    }
+
+    [HarmonyPatch(typeof(PlanetLayer), "CalculateAverageTileSize")]
+    [EarlyPatch]
+    public static class PlanetLayer_CalculateAverageTileSize_Patch
+    {
+        private delegate float CalculateAverageTileSizeDelegate(
+            in Unity.Collections.NativeArray<int> tileIDToNeighbors_offsets,
+            in Unity.Collections.NativeArray<PlanetTile> tileIDToNeighbors_values,
+            in Unity.Collections.NativeArray<int> tileIDToVerts_offsets,
+            in Unity.Collections.NativeArray<Vector3> verts);
+
+        private static readonly CalculateAverageTileSizeDelegate Fallback;
+
+        static PlanetLayer_CalculateAverageTileSize_Patch()
+        {
+            MethodInfo targetMethod = AccessTools.DeclaredMethod(typeof(PlanetLayer), "CalculateAverageTileSize$BurstManaged");
+            if (targetMethod != null)
+            {
+                Fallback = (CalculateAverageTileSizeDelegate)Delegate.CreateDelegate(
+                    typeof(CalculateAverageTileSizeDelegate),
+                    targetMethod);
+            }
+        }
+
+        public static bool Prepare() => Fallback != null;
+
+        [HarmonyPrefix]
+        public static bool Prefix(
+            in Unity.Collections.NativeArray<int> tileIDToNeighbors_offsets,
+            in Unity.Collections.NativeArray<PlanetTile> tileIDToNeighbors_values,
+            in Unity.Collections.NativeArray<int> tileIDToVerts_offsets,
+            in Unity.Collections.NativeArray<Vector3> verts,
+            ref float __result)
+        {
+            __result = Fallback(in tileIDToNeighbors_offsets, in tileIDToNeighbors_values, in tileIDToVerts_offsets, in verts);
+            return false;
+        }
+    }
+
+    [HarmonyPatch(typeof(PlanetLayer), "IntGetTileSize")]
+    [EarlyPatch]
+    public static class PlanetLayer_IntGetTileSize_Patch
+    {
+        private delegate float IntGetTileSizeDelegate(
+            in Unity.Collections.NativeArray<int> tileIDToNeighbors_offsets,
+            in Unity.Collections.NativeArray<PlanetTile> tileIDToNeighbors_values,
+            in Unity.Collections.NativeArray<int> tileIDToVerts_offsets,
+            in Unity.Collections.NativeArray<Vector3> verts,
+            in PlanetTile tile);
+
+        private static readonly IntGetTileSizeDelegate Fallback;
+
+        static PlanetLayer_IntGetTileSize_Patch()
+        {
+            MethodInfo targetMethod = AccessTools.DeclaredMethod(typeof(PlanetLayer), "IntGetTileSize$BurstManaged");
+            if (targetMethod != null)
+            {
+                Fallback = (IntGetTileSizeDelegate)Delegate.CreateDelegate(
+                    typeof(IntGetTileSizeDelegate),
+                    targetMethod);
+            }
+        }
+
+        public static bool Prepare() => Fallback != null;
+
+        [HarmonyPrefix]
+        public static bool Prefix(
+            in Unity.Collections.NativeArray<int> tileIDToNeighbors_offsets,
+            in Unity.Collections.NativeArray<PlanetTile> tileIDToNeighbors_values,
+            in Unity.Collections.NativeArray<int> tileIDToVerts_offsets,
+            in Unity.Collections.NativeArray<Vector3> verts,
+            in PlanetTile tile,
+            ref float __result)
+        {
+            __result = Fallback(in tileIDToNeighbors_offsets, in tileIDToNeighbors_values, in tileIDToVerts_offsets, in verts, in tile);
+            return false;
+        }
+    }
+
+    [HarmonyPatch(typeof(PlanetLayer), "IntGetTileCenter")]
+    [EarlyPatch]
+    public static class PlanetLayer_IntGetTileCenter_Patch
+    {
+        private delegate void IntGetTileCenterDelegate(
+            in Unity.Collections.NativeArray<int> tileIDToVerts_offsets,
+            in Unity.Collections.NativeArray<Vector3> verts,
+            int tileID,
+            out Vector3 center);
+
+        private static readonly IntGetTileCenterDelegate Fallback;
+
+        static PlanetLayer_IntGetTileCenter_Patch()
+        {
+            MethodInfo targetMethod = AccessTools.DeclaredMethod(typeof(PlanetLayer), "IntGetTileCenter$BurstManaged");
+            if (targetMethod != null)
+            {
+                Fallback = (IntGetTileCenterDelegate)Delegate.CreateDelegate(
+                    typeof(IntGetTileCenterDelegate),
+                    targetMethod);
+            }
+        }
+
+        public static bool Prepare() => Fallback != null;
+
+        [HarmonyPrefix]
+        public static bool Prefix(
+            in Unity.Collections.NativeArray<int> tileIDToVerts_offsets,
+            in Unity.Collections.NativeArray<Vector3> verts,
+            int tileID,
+            out Vector3 center)
+        {
+            Fallback(in tileIDToVerts_offsets, in verts, tileID, out center);
+            return false;
         }
     }
 }
