@@ -55,8 +55,10 @@ namespace Multiplayer.Client
         {
             if (Multiplayer.Client == null) return frameCount;
 
-            // The frame count differs between clients. Pawns without a map (caravans, world pawns) use the timer.
-            return tracker.pawn.MapHeld?.AsyncTime()?.eventCount ?? TickPatch.Timer;
+            // Fast-path: check direct pawn map reference before falling back to MapHeld
+            var pawn = tracker.pawn;
+            var map = pawn.mapIndexOrState >= 0 ? (pawn.Map ?? pawn.MapHeld) : null;
+            return map?.AsyncTime()?.eventCount ?? TickPatch.Timer;
         }
     }
 

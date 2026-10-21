@@ -326,6 +326,8 @@ namespace Multiplayer.Client
             return false;
         }
 
+        private static readonly List<AsyncTimeComp> LockstepMapsBuffer = new(8);
+
         // Without async time the world and the maps share one clock, but each tickable used to tick through its own
         // accumulator, and they drifted apart (#339): a new map started with a fresh accumulator and got an extra tick,
         // a rate change during a map tick (a pausing letter, TimeSlower, a pausing session) reached only the tickables
@@ -341,7 +343,6 @@ namespace Multiplayer.Client
             world.TimeToTickThrough += 1f;
 
             worked = true;
-            List<AsyncTimeComp> maps = null;
 
             while (world.TimeToTickThrough >= 0)
             {
@@ -351,17 +352,27 @@ namespace Multiplayer.Client
                 world.TimeToTickThrough -= timePerTick;
                 TickOnce(world);
 
-                // Same order as AllTickables
-                maps ??= new List<AsyncTimeComp>();
-                maps.Clear();
+                // Same order as AllTickables, using reusable buffer to eliminate per-tick list allocations
+                LockstepMapsBuffer.Clear();
                 var gameMaps = Find.Maps;
-                for (int i = gameMaps.Count - 1; i >= 0; i--)
-                    if (gameMaps[i].AsyncTime() is { } comp)
-                        maps.Add(comp);
+                if (gameMaps != null)
+                {
+                    for (int i = gameMaps.Count - 1; i >= 0; i--)
+                    {
+                        var comp = gameMaps[i].AsyncTime();
+                        if (comp != null)
+                            LockstepMapsBuffer.Add(comp);
+                    }
+                }
 
-                foreach (var comp in maps)
+                for (int i = 0; i < LockstepMapsBuffer.Count; i++)
+                {
+                    var comp = LockstepMapsBuffer[i];
                     if (!comp.map.Disposed && Find.Maps.Contains(comp.map)) // Removed during this game tick
                         TickOnce(comp);
+                }
+
+                LockstepMapsBuffer.Clear();
             }
         }
 

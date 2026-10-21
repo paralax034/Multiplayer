@@ -58,6 +58,52 @@ public static class TimeControlPatch
             timerRect.yMin -= TimeControls.TimeButSize.y;
     }
 
+    /// <summary>
+    /// Checks if any player has an active speed vote recorded for the specified tickable.
+    /// Uses struct enumerator iteration to prevent ValueCollection and closure heap allocations in OnGUI.
+    /// </summary>
+    static bool AnyVotes(int tickableId)
+    {
+        var playerData = Multiplayer.GameComp?.playerData;
+        if (playerData == null) return false;
+
+        foreach (var kvp in playerData)
+        {
+            if (kvp.Value.GetTimeVoteOrNull(tickableId) != null)
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Counts total votes matching the specified speed without LINQ allocations.
+    /// </summary>
+    static int GetPlayerVoteCount(int tickableId, TimeVote speed)
+    {
+        var playerData = Multiplayer.GameComp?.playerData;
+        if (playerData == null) return 0;
+
+        int count = 0;
+        foreach (var kvp in playerData)
+        {
+            if (kvp.Value.GetTimeVoteOrNull(tickableId) == speed)
+                count++;
+        }
+
+        return count;
+    }
+
+    /// <summary>
+    /// Generates label text displaying the active vote count for a specific game speed button.
+    /// </summary>
+    static string VoteCountLabel(TimeVote speed)
+    {
+        int votes = GetPlayerVoteCount(Tickable.TickableId, speed);
+        if (votes == 0) return "";
+        return CurTimeSpeedUI == speed ? $"{votes} ▲" : $"{votes}";
+    }
+
     // Based on TimeControls.DoTimeControlsGUI
     private static void DoTimeControlsGUI(Rect timerRect)
     {
@@ -75,10 +121,15 @@ public static class TimeControlPatch
             var descRect = rect.Down(TimeControls.TimeButSize.y).Width(timerRect.width);
 
             Widgets.DrawHighlightIfMouseover(descRect);
-            TooltipHandler.TipRegion(descRect, new TipSignal(
-                MpUtil.TranslateWithDoubleNewLines("MpLowestWinsButtonsDesc", 3) + VoteCountDetailed(),
-                483922
-            ));
+
+            // Defer tooltip string formatting until the cursor actually hovers over the vote description region
+            if (Mouse.IsOver(descRect))
+            {
+                TooltipHandler.TipRegion(descRect, new TipSignal(
+                    MpUtil.TranslateWithDoubleNewLines("MpLowestWinsButtonsDesc", 3) + VoteCountDetailed(),
+                    483922
+                ));
+            }
 
             if (Widgets.ButtonInvisible(descRect, false) && ShouldReset && Multiplayer.LocalServer != null)
                 SendTimeVote(TimeVote.ResetTickable);
@@ -88,7 +139,6 @@ public static class TimeControlPatch
         {
             if (Widgets.ButtonImage(rect, TexButton.SpeedButtonTextures[(uint)speed]))
             {
-                // todo Move the host check to the server?
                 if (ShouldReset && Multiplayer.LocalServer != null)
                     SendTimeVote(TimeVote.ResetTickable);
                 else if (speed == TimeVote.Paused)
@@ -171,24 +221,12 @@ public static class TimeControlPatch
         }
     }
 
-    static bool AnyVotes(int tickableId)
-    {
-        return Multiplayer.GameComp.playerData.Values.Any(p => p.GetTimeVoteOrNull(tickableId) != null);
-    }
-
     static IEnumerable<string> PlayerVotes(int tickableId, TimeVote vote)
     {
         return Multiplayer.GameComp.playerData
             .Where(p => p.Value.GetTimeVoteOrNull(Tickable.TickableId) == vote)
             .Select(p => Multiplayer.session.GetPlayerInfo(p.Key)?.username)
             .AllNotNull();
-    }
-
-    static string VoteCountLabel(TimeVote speed)
-    {
-        int votes = PlayerVotes(Tickable.TickableId, speed).Count();
-        if (votes == 0) return "";
-        return (CurTimeSpeedUI == speed ? $"{votes} ▲" : $"{votes}");
     }
 
     static string VoteCountDetailed()

@@ -38,11 +38,17 @@ namespace Multiplayer.Client
 
         public static AsyncTimeComp AsyncTime(this Map map)
         {
+            if (map == null) return null;
             var list = Multiplayer.game?.asyncTimeComps;
             if (list == null) return null;
+
             for (int i = 0; i < list.Count; i++)
-                if (list[i].map == map)
-                    return list[i];
+            {
+                var comp = list[i];
+                if (comp.map == map)
+                    return comp;
+            }
+
             return null;
         }
 

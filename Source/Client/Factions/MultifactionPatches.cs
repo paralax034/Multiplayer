@@ -1,6 +1,7 @@
 using HarmonyLib;
 using KTrie;
 using Multiplayer.API;
+using Multiplayer.Client.AsyncTime;
 using Multiplayer.Client.Factions;
 using RimWorld;
 using RimWorld.Planet;
@@ -368,13 +369,50 @@ static class DisableDraftGizmo
 {
     static IEnumerable<Gizmo> Postfix(IEnumerable<Gizmo> gizmos, Pawn_DraftController __instance)
     {
-        return __instance.pawn.Faction == Faction.OfPlayer ? gizmos : Enumerable.Empty<Gizmo>();
+        return __instance.pawn.Faction == Faction.OfPlayer ? gizmos : [];
     }
 }
 
+/// <summary>
+/// Injects a relation change gizmo on pawns belonging to other player factions.
+/// Lazily instantiates and caches the Command_Action on the main UI thread to prevent premature static class initialization during background sync registration.
+/// </summary>
 [HarmonyPatch(typeof(Pawn), nameof(Pawn.GetGizmos))]
 static class PawnChangeRelationGizmo
 {
+    private static Command_Action cachedCommand;
+
+    /// <summary>
+    /// Opens the relation change float menu for the currently inspected other player faction pawn.
+    /// </summary>
+    private static void OpenChangeRelationMenu()
+    {
+        if (Find.Selector.SingleSelectedThing is not Pawn pawn)
+            return;
+
+        var otherFaction = pawn.Faction;
+        if (otherFaction == null || !otherFaction.IsPlayer || otherFaction == Faction.OfPlayer)
+            return;
+
+        List<FloatMenuOption> list = new List<FloatMenuOption>(2)
+        {
+            new(FactionRelationKind.Hostile.ToString(), () =>
+            {
+                SetRelation(otherFaction, FactionRelationKind.Hostile);
+            }),
+            new(FactionRelationKind.Neutral.ToString(), () =>
+            {
+                SetRelation(otherFaction, FactionRelationKind.Neutral);
+            })
+        };
+
+        Find.WindowStack.Add(new FloatMenu(list));
+    }
+
+    /// <summary>
+    /// Postfix yields existing gizmos and appends the cached relation command when inspecting another player's colonist.
+    /// Defers command allocation to ensure MultiplayerStatic and ContentFinder are accessed only on the main thread after defs load.
+    /// </summary>
     static IEnumerable<Gizmo> Postfix(IEnumerable<Gizmo> gizmos, Pawn __instance)
     {
         foreach (var gizmo in gizmos)
@@ -385,29 +423,17 @@ static class PawnChangeRelationGizmo
 
         if (__instance.Faction is { IsPlayer: true } && __instance.Faction != Faction.OfPlayer)
         {
-            var otherFaction = __instance.Faction;
-
-            yield return new Command_Action
+            if (cachedCommand == null)
             {
-                defaultLabel = "Change faction relation",
-                icon = MultiplayerStatic.ChangeRelationIcon,
-                action = () =>
+                cachedCommand = new Command_Action
                 {
-                    List<FloatMenuOption> list = new List<FloatMenuOption>
-                    {
-                        new(FactionRelationKind.Hostile.ToString(), () =>
-                        {
-                            SetRelation(otherFaction, FactionRelationKind.Hostile);
-                        }),
-                        new(FactionRelationKind.Neutral.ToString(), () =>
-                        {
-                            SetRelation(otherFaction, FactionRelationKind.Neutral);
-                        })
-                    };
+                    defaultLabel = "Change faction relation",
+                    icon = MultiplayerStatic.ChangeRelationIcon,
+                    action = OpenChangeRelationMenu
+                };
+            }
 
-                    Find.WindowStack.Add(new FloatMenu(list));
-                }
-            };
+            yield return cachedCommand;
         }
     }
 
@@ -733,13 +759,72 @@ static class TakeToBedGuestFactionPatch
 
 /// <summary>
 /// Comprehensive security utility for resolving faction ownership of Things, Pawns, Prisoners, Corpses, and Map-level events.
+/// Includes temporal tile-to-faction caching to prevent nested linear scans over maps and world settlements during GUI frames.
 /// </summary>
 public static class LetterSecurityUtility
 {
+    private static readonly Dictionary<int, Faction> TileFactionCache = new(64);
+    private static int lastTileCacheTick = -1;
+
+    /// <summary>
+    /// Resolves the player faction associated with a specific planet tile.
+    /// Memoizes lookups per simulation tick to eliminate O(Maps + Settlements) traversal on UI loops.
+    /// </summary>
+    /// <param name="tile">Target world tile.</param>
+    /// <returns>Player faction owning the map or settlement at the tile, or null if none.</returns>
+    public static Faction GetPlayerFactionAtTile(PlanetTile tile)
+    {
+        int currentTick = TickPatch.Timer;
+        if (lastTileCacheTick != currentTick)
+        {
+            TileFactionCache.Clear();
+            lastTileCacheTick = currentTick;
+        }
+
+        int tileId = tile.tileId;
+        if (TileFactionCache.TryGetValue(tileId, out var cached))
+            return cached;
+
+        Faction result = null;
+        var maps = Find.Maps;
+        if (maps != null)
+        {
+            for (int m = 0; m < maps.Count; m++)
+            {
+                var map = maps[m];
+                if (map.Tile == tile && map.ParentFaction is { IsPlayer: true } mapFac)
+                {
+                    result = mapFac;
+                    break;
+                }
+            }
+        }
+
+        if (result == null && Find.WorldObjects?.Settlements != null)
+        {
+            var settlements = Find.WorldObjects.Settlements;
+            for (int s = 0; s < settlements.Count; s++)
+            {
+                var settlement = settlements[s];
+                if (settlement.Tile == tile && settlement.Faction is { IsPlayer: true } setFac)
+                {
+                    result = setFac;
+                    break;
+                }
+            }
+        }
+
+        TileFactionCache[tileId] = result;
+        return result;
+    }
+
     /// <summary>
     /// Resolves target affiliation for onscreen messages and audio alerts.
     /// Handles colonists, prisoners (via HostFaction), corpses, and map-level weather conditions.
     /// </summary>
+    /// <param name="lookTargets">Target references associated with the notification.</param>
+    /// <param name="faction">Faction against which visibility is evaluated.</param>
+    /// <returns>True if the target belongs to or is relevant to the specified faction; otherwise, false.</returns>
     public static bool IsTargetForFaction(LookTargets lookTargets, Faction faction)
     {
         if (faction == null) return true;
@@ -798,33 +883,10 @@ public static class LetterSecurityUtility
                 {
                     targetFaction = mhf;
                 }
-                // 5. Despawned tile tracking
+                // 5. Despawned tile tracking via memoized lookup
                 else if (thing.Tile.Valid)
                 {
-                    var maps = Find.Maps;
-                    for (int m = 0; m < maps.Count; m++)
-                    {
-                        var map = maps[m];
-                        if (map.Tile == thing.Tile && map.ParentFaction is { IsPlayer: true } mapFac)
-                        {
-                            targetFaction = mapFac;
-                            break;
-                        }
-                    }
-
-                    if (targetFaction == null && Find.WorldObjects?.Settlements != null)
-                    {
-                        var settlements = Find.WorldObjects.Settlements;
-                        for (int s = 0; s < settlements.Count; s++)
-                        {
-                            var settlement = settlements[s];
-                            if (settlement.Tile == thing.Tile && settlement.Faction is { IsPlayer: true } setFac)
-                            {
-                                targetFaction = setFac;
-                                break;
-                            }
-                        }
-                    }
+                    targetFaction = GetPlayerFactionAtTile(thing.Tile);
                 }
             }
             // World object targets (caravans, sites, settlements)
@@ -865,6 +927,9 @@ public static class LetterSecurityUtility
     /// <summary>
     /// Evaluates letter visibility using quest context, targets (with prisoner/corpse resolution), and MapContext fallback.
     /// </summary>
+    /// <param name="let">Letter instance to validate.</param>
+    /// <param name="faction">Faction against which visibility is evaluated.</param>
+    /// <returns>True if the letter is allowed to be displayed to the specified faction.</returns>
     public static bool IsLetterForFaction(Letter let, Faction faction)
     {
         if (faction == null) return true;
@@ -946,6 +1011,7 @@ static class LetterStackReceiveSoundOnlyMyFaction
 
 /// <summary>
 /// Filters onscreen message display so notifications regarding other players' colonists or bases remain hidden.
+/// Caches the filtered sequence per GUI frame to eliminate repeated O(N^2) filtering passes inside MessagesDoGUI loops.
 /// </summary>
 [HarmonyPatch(typeof(Messages), nameof(Messages.MessagesDoGUI))]
 static class MessagesDoGUIFilterPatch
@@ -967,17 +1033,30 @@ static class MessagesDoGUIFilterPatch
     }
 
     private static readonly List<Message> tmpFilteredMessages = new(16);
+    private static int lastEvaluatedFrame = -1;
+    private static int lastEvaluatedCount = -1;
 
+    /// <summary>
+    /// Returns the live messages filtered by the local player's faction visibility.
+    /// Uses frame-level and source-count memoization to prevent redundant evaluations on every loop iteration in MessagesDoGUI.
+    /// </summary>
     public static List<Message> GetFilteredLiveMessages()
     {
         var original = Messages.liveMessages;
         if (Multiplayer.Client == null || Multiplayer.game == null || !Multiplayer.GameComp.multifaction)
             return original;
 
+        int curFrame = Time.frameCount;
+        int origCount = original.Count;
+
+        // Return cached buffer if MessagesDoGUI is evaluating consecutive instructions within the same UI frame
+        if (lastEvaluatedFrame == curFrame && lastEvaluatedCount == origCount)
+            return tmpFilteredMessages;
+
         tmpFilteredMessages.Clear();
         var myFaction = Multiplayer.RealPlayerFaction;
 
-        for (int i = 0; i < original.Count; i++)
+        for (int i = 0; i < origCount; i++)
         {
             var msg = original[i];
             if (LetterSecurityUtility.IsTargetForFaction(msg.lookTargets, myFaction))
@@ -986,6 +1065,8 @@ static class MessagesDoGUIFilterPatch
             }
         }
 
+        lastEvaluatedFrame = curFrame;
+        lastEvaluatedCount = origCount;
         return tmpFilteredMessages;
     }
 }

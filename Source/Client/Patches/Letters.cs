@@ -96,23 +96,45 @@ namespace Multiplayer.Client.Patches
         public static List<Letter> realLetters;
         private static List<Letter> visibleLetters = new();
 
+        /// <summary>
+        /// Filters the letter stack before LettersOnGUI renders.
+        /// Uses indexed traversal instead of LINQ Enumerable.All to prevent delegate allocations on each GUI frame.
+        /// </summary>
         static void Prefix(LetterStack __instance, ref bool __state)
         {
             if (!MultifactionLetters.Active || realLetters != null) return;
 
             var letters = __instance.letters;
-            if (letters.All(MultifactionLetters.IsVisibleLocally)) return;
+            if (letters == null || letters.Count == 0) return;
+
+            bool anyHidden = false;
+            for (int i = 0; i < letters.Count; i++)
+            {
+                if (!MultifactionLetters.IsVisibleLocally(letters[i]))
+                {
+                    anyHidden = true;
+                    break;
+                }
+            }
+
+            if (!anyHidden) return;
 
             visibleLetters.Clear();
-            foreach (var letter in letters)
+            for (int i = 0; i < letters.Count; i++)
+            {
+                var letter = letters[i];
                 if (MultifactionLetters.IsVisibleLocally(letter))
                     visibleLetters.Add(letter);
+            }
 
             realLetters = letters;
             __instance.letters = visibleLetters;
             __state = true;
         }
 
+        /// <summary>
+        /// Restores the original letter stack after GUI rendering completes.
+        /// </summary>
         static void Finalizer(LetterStack __instance, bool __state)
         {
             if (!__state) return;
@@ -122,9 +144,12 @@ namespace Multiplayer.Client.Patches
             realLetters = null;
 
             // Removals are applied by LetterStackRemoveDuringFilteredGUI, add letters received while drawing
-            foreach (var letter in drawn)
+            for (int i = 0; i < drawn.Count; i++)
+            {
+                var letter = drawn[i];
                 if (!__instance.letters.Contains(letter))
                     __instance.letters.Add(letter);
+            }
 
             visibleLetters.Clear();
         }

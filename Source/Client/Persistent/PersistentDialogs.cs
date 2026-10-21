@@ -240,20 +240,9 @@ namespace Multiplayer.Client
         protected static MethodInfo ScribeDeep = typeof(Scribe_Deep).GetMethods().First(m => m.Name == "Look" && m.GetParameters().Length == 3);
     }
 
-    public abstract class PersistentDialog<T> : PersistentDialog where T : Dialog_NodeTree
+    public abstract class PersistentDialog<T>(Map map) : PersistentDialog(map) where T : Dialog_NodeTree
     {
         public T dialog;
-
-        protected PersistentDialog(Map map) : base(map)
-        {
-
-        }
-
-        protected PersistentDialog(Map map, T dialog) : this(map)
-        {
-            id = Find.UniqueIDsManager.GetNextThingID();
-            this.dialog = dialog;
-        }
 
         bool radioMode;
         string title;
@@ -263,7 +252,36 @@ namespace Multiplayer.Client
         List<DiaNodeSave> saveNodes;
         List<FieldSave> fieldValues;
 
+        protected PersistentDialog(Map map, T dialog) : this(map)
+        {
+            id = Find.UniqueIDsManager.GetNextThingID();
+            this.dialog = dialog;
+        }
+
         public override Dialog_NodeTree Dialog => dialog;
+
+        /// <summary>
+        /// Collects all fields from an action or callback delegate into a destination HashSet without generating iterator objects.
+        /// </summary>
+        private void CollectDelegateValues(Delegate del, HashSet<FieldSave> set)
+        {
+            if (del == null) return;
+
+            set.Add(new FieldSave(this, del.GetType(), del));
+
+            var target = del.Target;
+            if (target == null) return;
+
+            set.Add(new FieldSave(this, target.GetType(), target));
+
+            var fields = target.GetType().GetDeclaredInstanceFields();
+            for (int i = 0; i < fields.Length; i++)
+            {
+                var field = fields[i];
+                if (!field.FieldType.IsCompilerGenerated())
+                    set.Add(new FieldSave(this, field.FieldType, field.GetValue(target)));
+            }
+        }
 
         public override void ExposeData()
         {
@@ -279,15 +297,25 @@ namespace Multiplayer.Client
 
                 rootNode = nodes[0];
 
-                saveNodes = new List<DiaNodeSave>();
-                foreach (var node in nodes)
-                    saveNodes.Add(new DiaNodeSave(this, node));
+                saveNodes = new List<DiaNodeSave>(nodes.Count);
+                for (int i = 0; i < nodes.Count; i++)
+                    saveNodes.Add(new DiaNodeSave(this, nodes[i]));
 
-                fieldValues = nodes
-                    .SelectMany(n => n.options)
-                    .SelectMany(o => DelegateValues(o.action).Concat(DelegateValues(o.linkLateBind)))
-                    .Distinct(new FieldSaveEquality())
-                    .ToList();
+                var fieldSet = new HashSet<FieldSave>(new FieldSaveEquality());
+                for (int n = 0; n < nodes.Count; n++)
+                {
+                    var options = nodes[n].options;
+                    if (options == null) continue;
+
+                    for (int o = 0; o < options.Count; o++)
+                    {
+                        var opt = options[o];
+                        CollectDelegateValues(opt.action, fieldSet);
+                        CollectDelegateValues(opt.linkLateBind, fieldSet);
+                    }
+                }
+
+                fieldValues = [.. fieldSet];
 
                 Scribe_Collections.Look(ref fieldValues, "fieldValues", LookMode.Deep);
                 Scribe_Collections.Look(ref saveNodes, "nodes", LookMode.Deep);
@@ -461,21 +489,26 @@ namespace Multiplayer.Client
             }
         }
 
-        class FieldSave : IExposable
+        class FieldSave(PersistentDialog<T> parent) : IExposable
         {
-            public PersistentDialog<T> parent;
+            public PersistentDialog<T> parent = parent;
             public Type type;
             public string typeName;
             public object value;
             private LookMode mode;
 
-            public FieldSave(PersistentDialog<T> parent)
-            {
-                this.parent = parent;
-            }
-
+            private static readonly Dictionary<Type, MethodInfo> ScribeValuesGenericCache = [];
+            private static readonly Dictionary<Type, MethodInfo> ScribeDefsGenericCache = [];
+            private static readonly Dictionary<Type, MethodInfo> ScribeReferencesGenericCache = [];
+            private static readonly Dictionary<Type, MethodInfo> ScribeDeepGenericCache = [];
             public const LookMode DelegateMode = (LookMode)101;
             public const LookMode PlainObjectMode = (LookMode)100;
+
+            private Dictionary<string, int> fields;
+
+            private string methodDeclaringType;
+            private string methodName;
+            private int targetIndex;
 
             public FieldSave(PersistentDialog<T> parent, Type type, object value) : this(parent)
             {
@@ -499,11 +532,45 @@ namespace Multiplayer.Client
                     mode = PlainObjectMode;
             }
 
-            private Dictionary<string, int> fields;
+            private static MethodInfo GetGenericScribeValues(Type t)
+            {
+                if (!ScribeValuesGenericCache.TryGetValue(t, out var m))
+                {
+                    m = ScribeValues.MakeGenericMethod(t);
+                    ScribeValuesGenericCache[t] = m;
+                }
+                return m;
+            }
 
-            private string methodDeclaringType;
-            private string methodName;
-            private int targetIndex;
+            private static MethodInfo GetGenericScribeDefs(Type t)
+            {
+                if (!ScribeDefsGenericCache.TryGetValue(t, out var m))
+                {
+                    m = ScribeDefs.MakeGenericMethod(t);
+                    ScribeDefsGenericCache[t] = m;
+                }
+                return m;
+            }
+
+            private static MethodInfo GetGenericScribeReferences(Type t)
+            {
+                if (!ScribeReferencesGenericCache.TryGetValue(t, out var m))
+                {
+                    m = ScribeReferences.MakeGenericMethod(t);
+                    ScribeReferencesGenericCache[t] = m;
+                }
+                return m;
+            }
+
+            private static MethodInfo GetGenericScribeDeep(Type t)
+            {
+                if (!ScribeDeepGenericCache.TryGetValue(t, out var m))
+                {
+                    m = ScribeDeep.MakeGenericMethod(t);
+                    ScribeDeepGenericCache[t] = m;
+                }
+                return m;
+            }
 
             public void ExposeData()
             {
@@ -516,28 +583,28 @@ namespace Multiplayer.Client
                 if (mode == LookMode.Value)
                 {
                     var args = new[] { value, "value", Common.Extensions.GetDefaultValue(type), false };
-                    ScribeValues.MakeGenericMethod(type).Invoke(null, args);
+                    GetGenericScribeValues(type).Invoke(null, args);
                     if (Scribe.mode == LoadSaveMode.LoadingVars)
                         value = args[0];
                 }
                 else if (mode == LookMode.Def)
                 {
                     var args = new[] { value, "value" };
-                    ScribeDefs.MakeGenericMethod(type).Invoke(null, args);
+                    GetGenericScribeDefs(type).Invoke(null, args);
                     if (Scribe.mode == LoadSaveMode.LoadingVars)
                         value = args[0];
                 }
                 else if (mode == LookMode.Reference)
                 {
                     var args = new[] { value, "value", false };
-                    ScribeReferences.MakeGenericMethod(type).Invoke(null, args);
+                    GetGenericScribeReferences(type).Invoke(null, args);
                     if (Scribe.mode == LoadSaveMode.ResolvingCrossRefs)
                         value = args[0];
                 }
                 else if (mode == LookMode.Deep)
                 {
                     var args = new[] { value, "value", Array.Empty<object>() };
-                    ScribeDeep.MakeGenericMethod(type).Invoke(null, args);
+                    GetGenericScribeDeep(type).Invoke(null, args);
                     if (Scribe.mode == LoadSaveMode.LoadingVars)
                         value = args[0];
                 }
@@ -545,7 +612,7 @@ namespace Multiplayer.Client
                 {
                     if (Scribe.mode == LoadSaveMode.Saving)
                     {
-                        fields = new Dictionary<string, int>();
+                        fields = [];
                         foreach (var field in type.GetDeclaredInstanceFields())
                             if (!field.FieldType.IsCompilerGenerated())
                                 fields[field.Name] = parent.fieldValues.FindIndex(v => Equals(v.value, field.GetValue(value)));
@@ -666,7 +733,7 @@ namespace Multiplayer.Client
             if (Multiplayer.Client == null) return true;
 
             var type = __instance.GetType();
-            if (__instance is Dialog_NodeTree) return true;
+            if (__instance is not null) return true;
 
             return !Multiplayer.InInterface;
         }

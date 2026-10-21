@@ -68,9 +68,33 @@ namespace Multiplayer.Client
             GUI.EndGroup();
         }
 
+        private static readonly List<Faction> TmpPlayerFactions = new(8);
+        private static readonly List<Map> TmpFactionHomes = new(4);
+        private static TaggedString CachedJoinLabel;
+        private static TaggedString CachedLocateLabel;
+
+        /// <summary>
+        /// Renders the faction chooser list for joining existing player factions.
+        /// Uses reusable list buffers and cached translation strings to eliminate per-frame allocations during scrolling.
+        /// </summary>
+        /// <param name="inRect">Bounding client area for the faction selection view.</param>
         private static void DrawFactionChooser(Rect inRect)
         {
-            var allPlayerFactions = Find.FactionManager.AllFactions.Where(f => f.IsPlayer).Where(f => f.name != "Spectator");
+            if (CachedJoinLabel.NullOrEmpty())
+                CachedJoinLabel = "MpJoin".Translate();
+            if (CachedLocateLabel.NullOrEmpty())
+                CachedLocateLabel = "MpLocateOnMap".Translate();
+
+            TmpPlayerFactions.Clear();
+            var allFactions = Find.FactionManager.AllFactionsListForReading;
+            for (int f = 0; f < allFactions.Count; f++)
+            {
+                var fac = allFactions[f];
+                if (fac.IsPlayer && fac.name != "Spectator")
+                {
+                    TmpPlayerFactions.Add(fac);
+                }
+            }
 
             // Join Faction Headline
             inRect.yMin += 5f;
@@ -89,15 +113,15 @@ namespace Multiplayer.Client
 
             // Faction List
             Rect outRect = new Rect(0, inRect.yMin + 10, inRect.width - 16, inRect.height - 20);
-            float height = allPlayerFactions.Count() * 40;
+            float height = TmpPlayerFactions.Count * 40f;
             Rect viewRect = new Rect(0, 0, outRect.width - 16f, height);
             Widgets.BeginScrollView(outRect, ref joinFactionScroll, viewRect, true);
 
             float y = 0;
-            int i = 0;
 
-            foreach (var playerFaction in allPlayerFactions)
+            for (int i = 0; i < TmpPlayerFactions.Count; i++)
             {
+                var playerFaction = TmpPlayerFactions[i];
                 Rect entryRect = new Rect(16, y, viewRect.width, 40);
                 if (i % 2 == 0)
                     Widgets.DrawAltRect(entryRect);
@@ -106,9 +130,19 @@ namespace Multiplayer.Client
                     LabelWithIcon(entryRect, playerFaction.Name, playerFaction.def.FactionIcon, playerFaction.Color, 0.6f);
 
                 Rect joinButton = new Rect(entryRect.xMax - 75, entryRect.y + 5, 70, 40 - 10);
-                if (Widgets.ButtonText(joinButton, "MpJoin".Translate()))
+                if (Widgets.ButtonText(joinButton, CachedJoinLabel))
                 {
-                    var factionHome = Find.Maps.FirstOrDefault(m => m.ParentFaction == playerFaction);
+                    Map factionHome = null;
+                    var maps = Find.Maps;
+                    for (int m = 0; m < maps.Count; m++)
+                    {
+                        if (maps[m].ParentFaction == playerFaction)
+                        {
+                            factionHome = maps[m];
+                            break;
+                        }
+                    }
+
                     if (factionHome != null)
                     {
                         Current.Game.CurrentMap = factionHome;
@@ -122,24 +156,31 @@ namespace Multiplayer.Client
                 Rect locateButton = new Rect(entryRect.xMax - 110, entryRect.y + 7, 24, 24);
                 if (Widgets.ButtonImage(locateButton, TexButton.OpenInspector))
                 {
-                    var factionHomes = Find.Maps.Where(m => m.ParentFaction == playerFaction).ToList();
-
-                    if (factionHomes.Count == 1)
+                    TmpFactionHomes.Clear();
+                    var maps = Find.Maps;
+                    for (int m = 0; m < maps.Count; m++)
                     {
-                        CameraJumper.TryJumpAndSelect(factionHomes[0].Parent, CameraJumper.MovementMode.Pan);
+                        if (maps[m].ParentFaction == playerFaction)
+                            TmpFactionHomes.Add(maps[m]);
                     }
-                    else if (factionHomes.Count > 1)
+
+                    if (TmpFactionHomes.Count == 1)
+                    {
+                        CameraJumper.TryJumpAndSelect(TmpFactionHomes[0].Parent, CameraJumper.MovementMode.Pan);
+                    }
+                    else if (TmpFactionHomes.Count > 1)
                     {
                         List<FloatMenuOption> list = new();
-                        foreach (Map m in factionHomes)
+                        for (int h = 0; h < TmpFactionHomes.Count; h++)
                         {
+                            var m = TmpFactionHomes[h];
                             if (!m.IsPocketMap)
                             {
                                 string label = m.Parent.LabelCap;
                                 if (GravshipUtility.TryGetNameOfGravshipOnMap(m, out string shipName))
                                     label += " (" + shipName + ")";
 
-                                var capturedMap = m; // <-- Closure-safe
+                                var capturedMap = m;
                                 list.Add(new FloatMenuOption(label, () =>
                                 {
                                     CameraJumper.TryJumpAndSelect(capturedMap.Parent, CameraJumper.MovementMode.Pan);
@@ -150,14 +191,17 @@ namespace Multiplayer.Client
                         }
                         Find.WindowStack.Add(new FloatMenu(list));
                     }
+
+                    TmpFactionHomes.Clear();
                 }
 
-                TooltipHandler.TipRegion(locateButton, "MpLocateOnMap".Translate());
+                TooltipHandler.TipRegion(locateButton, CachedLocateLabel);
 
                 y += entryRect.height;
-                i++;
             }
+
             Widgets.EndScrollView();
+            TmpPlayerFactions.Clear();
             // END Faction List
         }
         private static void DrawFactionCreator(Rect inRect)

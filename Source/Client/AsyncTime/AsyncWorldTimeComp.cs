@@ -47,11 +47,33 @@ public class AsyncWorldTimeComp : IExposable, ITickable
     // Run at the speed of the fastest map or at chosen speed if there are no maps
     public TimeSpeed DesiredTimeSpeed
     {
-        get => !Find.Maps.Any()
-            ? timeSpeedInt
-            : Find.Maps.Select(m => m.AsyncTime())
-                .Where(a => a != null && a.ActualRateMultiplier(a.DesiredTimeSpeed) != 0f)
-                .Max(a => a?.DesiredTimeSpeed) ?? TimeSpeed.Paused;
+        get
+        {
+            var maps = Find.Maps;
+            if (maps == null || maps.Count == 0)
+                return timeSpeedInt;
+
+            TimeSpeed maxSpeed = TimeSpeed.Paused;
+            bool anyRunning = false;
+
+            // Zero-allocation indexed evaluation replacing LINQ Select/Where/Max cascade
+            for (int i = 0; i < maps.Count; i++)
+            {
+                var asyncTime = maps[i].AsyncTime();
+                if (asyncTime == null)
+                    continue;
+
+                var desired = asyncTime.DesiredTimeSpeed;
+                if (asyncTime.ActualRateMultiplier(desired) != 0f)
+                {
+                    anyRunning = true;
+                    if (desired > maxSpeed)
+                        maxSpeed = desired;
+                }
+            }
+
+            return anyRunning ? maxSpeed : TimeSpeed.Paused;
+        }
         set => timeSpeedInt = value;
     }
 
@@ -187,9 +209,8 @@ public class AsyncWorldTimeComp : IExposable, ITickable
 
         if (Multiplayer.GameComp.multifaction)
         {
+            // PushFaction with force: true already captures state and applies the faction to all maps
             FactionExtensions.PushFaction(null, Multiplayer.WorldComp.spectatorFaction, force: true);
-            foreach (var map in Find.Maps)
-                map.MpComp().SetFaction(Multiplayer.WorldComp.spectatorFaction);
         }
     }
 
@@ -197,9 +218,8 @@ public class AsyncWorldTimeComp : IExposable, ITickable
     {
         if (Multiplayer.GameComp.multifaction)
         {
-            var f = FactionExtensions.PopFaction();
-            foreach (var map in Find.Maps)
-                map.MpComp().SetFaction(f);
+            // PopFaction already restores captured per-map previous faction states via AppliedFactions.Restore
+            FactionExtensions.PopFaction();
         }
 
         randState = Rand.StateCompressed;

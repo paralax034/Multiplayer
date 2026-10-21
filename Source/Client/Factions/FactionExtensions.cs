@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using RimWorld;
@@ -75,22 +76,41 @@ public static class FactionExtensions
     // The factions whose data the world and the maps held before a forced push
     private class AppliedFactions
     {
+        private static readonly Stack<AppliedFactions> Pool = new(16);
+
         private int worldFactionId;
         private List<MultiplayerMapComp> comps;
-        private int[] mapFactionIds;
+        private int[] mapFactionIds = new int[16];
+        private int mapCount;
 
+        /// <summary>
+        /// Captures current map faction mappings using pooled state objects to eliminate GC pressure during ticks.
+        /// </summary>
         public static AppliedFactions Capture()
         {
-            var applied = new AppliedFactions
+            AppliedFactions applied;
+            lock (Pool)
             {
-                worldFactionId = Multiplayer.WorldComp?.GetAppliedFactionId() ?? -1,
-                comps = Multiplayer.game?.mapComps
-            };
+                applied = Pool.Count > 0 ? Pool.Pop() : new AppliedFactions();
+            }
 
-            var count = applied.comps?.Count ?? 0;
-            applied.mapFactionIds = new int[count];
+            applied.worldFactionId = Multiplayer.WorldComp?.GetAppliedFactionId() ?? -1;
+            applied.comps = Multiplayer.game?.mapComps;
+
+            int count = applied.comps?.Count ?? 0;
+            applied.mapCount = count;
+
+            if (applied.mapFactionIds.Length < count)
+            {
+                int newCap = Math.Max(applied.mapFactionIds.Length * 2, count);
+                applied.mapFactionIds = new int[newCap];
+            }
+
             for (int i = 0; i < count; i++)
-                applied.mapFactionIds[i] = IsLive(applied.comps[i]) ? applied.comps[i].GetAppliedFactionId() : -1;
+            {
+                var comp = applied.comps[i];
+                applied.mapFactionIds[i] = IsLive(comp) ? comp.GetAppliedFactionId() : -1;
+            }
 
             return applied;
         }
@@ -98,21 +118,34 @@ public static class FactionExtensions
         // Maps without a known previous faction (e.g. generated in between) get the popped faction
         public void Restore(Faction popped)
         {
-            var worldComp = Multiplayer.WorldComp;
-            if (worldComp != null && (worldFactionId == -1 || !worldComp.SetFaction(worldFactionId)))
-                worldComp.SetFaction(popped);
-
-            var currentComps = Multiplayer.game?.mapComps;
-            if (currentComps == null) return;
-
-            for (int i = 0; i < currentComps.Count; i++)
+            try
             {
-                var comp = currentComps[i];
-                if (!IsLive(comp)) continue;
+                var worldComp = Multiplayer.WorldComp;
+                if (worldComp != null && (worldFactionId == -1 || !worldComp.SetFaction(worldFactionId)))
+                    worldComp.SetFaction(popped);
 
-                var id = currentComps == comps && i < mapFactionIds.Length ? mapFactionIds[i] : -1;
-                if (id == -1 || !comp.SetFaction(id))
-                    comp.SetFaction(popped);
+                var currentComps = Multiplayer.game?.mapComps;
+                if (currentComps != null)
+                {
+                    for (int i = 0; i < currentComps.Count; i++)
+                    {
+                        var comp = currentComps[i];
+                        if (!IsLive(comp)) continue;
+
+                        var id = currentComps == comps && i < mapCount ? mapFactionIds[i] : -1;
+                        if (id == -1 || !comp.SetFaction(id))
+                            comp.SetFaction(popped);
+                    }
+                }
+            }
+            finally
+            {
+                comps = null;
+                lock (Pool)
+                {
+                    if (Pool.Count < 32)
+                        Pool.Push(this);
+                }
             }
         }
     }

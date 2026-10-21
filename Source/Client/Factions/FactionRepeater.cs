@@ -251,9 +251,7 @@ namespace Multiplayer.Client
             if (__state == null || !__instance.Destroyed) return;
 
             var factionData = __state.MpComp()?.factionData;
-            if (factionData == null || !factionData.Values.Any(d =>
-                    d.designationManager != __state.designationManager &&
-                    d.designationManager.AllDesignationsOn(__instance).Count > 0))
+            if (factionData == null || !HasAnyOtherFactionDesignation(factionData, __state.designationManager, __instance))
                 return;
 
             var ignore = false;
@@ -263,6 +261,24 @@ namespace Multiplayer.Client
                 __state,
                 ref ignore
             );
+        }
+
+        private static bool HasAnyOtherFactionDesignation(SortedDictionary<int, FactionMapData> factionData, DesignationManager installed, Thing thing)
+        {
+            foreach (var data in factionData.Values)
+            {
+                var mgr = data.designationManager;
+                if (mgr == installed) continue;
+
+                var allDes = mgr.AllDesignations;
+                for (int i = 0; i < allDes.Count; i++)
+                {
+                    if (allDes[i].target.Thing == thing)
+                        return true;
+                }
+            }
+
+            return false;
         }
     }
 

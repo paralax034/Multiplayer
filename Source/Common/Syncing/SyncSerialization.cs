@@ -4,6 +4,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using System.Runtime.CompilerServices;
 using Multiplayer.Client;
 
@@ -22,7 +23,7 @@ namespace Multiplayer.Common
         public HashSet<Type> syncWithImplTypes = [];
         public SyncTypeHelper TypeHelper { get; } = typeHelper;
 
-        public Action<string> errorLogger = msg => Console.WriteLine($"Sync Error: {msg}");
+        public Action<string> errorLogger = static msg => Console.WriteLine($"Sync Error: {msg}");
 
         /// <summary>
         /// Generic static cache storing compiled IL delegates for primitive sync read and write routines.
@@ -102,9 +103,46 @@ namespace Multiplayer.Common
 
         public SyncWorkerDictionaryTree? syncTree;
 
-        private static readonly Type[] supportedSystemGtds =
-            [typeof(List<>), typeof(IEnumerable<>), typeof(Nullable<>), typeof(Dictionary<,>), typeof(HashSet<>)];
+        private static readonly HashSet<Type> supportedSystemGtds =
+             [typeof(List<>), typeof(IEnumerable<>), typeof(Nullable<>), typeof(Dictionary<,>), typeof(HashSet<>)];
 
+        private static readonly Dictionary<Type, (FieldInfo item1, FieldInfo item2)> ValueTupleFieldCache = [];
+        private static readonly Dictionary<Type, ConstructorInfo> TupleConstructorCache = [];
+
+        /// <summary>
+        /// Validates that all generic arguments of a generic type can be handled by this serializer instance.
+        /// Uses indexed loop traversal to prevent LINQ delegate allocations and avoid static closure scoping errors.
+        /// </summary>
+        /// <param name="genericType">Generic type definition or constructed generic type.</param>
+        /// <returns>True if every type argument can be serialized; otherwise, false.</returns>
+        public bool CanHandleGenericArgs(Type genericType)
+        {
+            Type[] args = genericType.GetGenericArguments();
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (!CanHandle(args[i]))
+                    return false;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Deserializes a strongly-typed object from the specified ByteReader stream using this instance context.
+        /// </summary>
+        /// <typeparam name="T">Expected object type.</typeparam>
+        /// <param name="data">Source byte stream.</param>
+        /// <returns>Deserialized instance or default value.</returns>
+        public T? ReadSync<T>(ByteReader data)
+        {
+            return (T?)ReadSyncObject(data, typeof(T));
+        }
+
+        /// <summary>
+        /// Determines whether the serializer can process the requested sync type.
+        /// Uses O(1) set lookups and indexed loop traversal to prevent predicate allocations on hot type verification paths.
+        /// </summary>
+        /// <param name="syncType">Type wrapper containing metadata.</param>
+        /// <returns>True if the type has an established serialization worker or handler.</returns>
         public bool CanHandle(SyncType syncType)
         {
             var type = syncType.type;
@@ -127,23 +165,16 @@ namespace Multiplayer.Common
                 (supportedSystemGtds.Contains(gtd) || typeof(ITuple).IsAssignableFrom(gtd)))
                 return CanHandleGenericArgs(type);
 
-            if (Enumerable.Any(canHandleHooks, hook => hook(syncType)))
-                return true;
+            for (int i = 0; i < canHandleHooks.Count; i++)
+            {
+                if (canHandleHooks[i](syncType))
+                    return true;
+            }
 
             if (syncWithImplTypes.Contains(syncType.type))
                 return true;
 
             return syncTree != null && syncTree.TryGetValue(type, out _);
-        }
-
-        public bool CanHandleGenericArgs(Type genericType)
-        {
-            return genericType.GetGenericArguments().All(arg => CanHandle(arg));
-        }
-
-        public T? ReadSync<T>(ByteReader data)
-        {
-            return (T?)ReadSyncObject(data, typeof(T));
         }
 
         // Serialization order:
@@ -180,6 +211,10 @@ namespace Multiplayer.Common
             }
         }
 
+        /// <summary>
+        /// Internal recursive object deserializer.
+        /// Replaces repetitive reflection constructor searches with cached ConstructorInfo instances.
+        /// </summary>
         private object? ReadSyncObjectInternal(ByteReader data, SyncType syncType)
         {
             Type type = syncType.type;
@@ -303,10 +338,15 @@ namespace Multiplayer.Common
                             ReadSyncObject(data, arguments[1])
                         ];
 
-                        return type.GetConstructors().First().Invoke(parameters);
+                        if (!TupleConstructorCache.TryGetValue(type, out var ctor))
+                        {
+                            ctor = type.GetConstructors()[0];
+                            TupleConstructorCache[type] = ctor;
+                        }
+
+                        return ctor.Invoke(parameters);
                     }
 
-                    // todo handle null non-value Tuples?
                     if (typeof(ITuple).IsAssignableFrom(genericTypeDefinition)) // ValueTuple or Tuple
                     {
                         Type[] arguments = type.GetGenericArguments();
@@ -317,13 +357,22 @@ namespace Multiplayer.Common
                         for (int i = 0; i < size; i++)
                             values[i] = ReadSyncObject(data, arguments[i]);
 
-                        return type.GetConstructors().First().Invoke(values);
+                        if (!TupleConstructorCache.TryGetValue(type, out var ctor))
+                        {
+                            ctor = type.GetConstructors()[0];
+                            TupleConstructorCache[type] = ctor;
+                        }
+
+                        return ctor.Invoke(values);
                     }
                 }
 
-                foreach (var hook in serializationHooks)
+                for (int i = 0; i < serializationHooks.Count; i++)
+                {
+                    var hook = serializationHooks[i];
                     if (hook.Item1(syncType))
                         return hook.Item2(data, type);
+                }
 
                 if (typeof(ISynchronizable).IsAssignableFrom(type))
                 {
@@ -362,11 +411,21 @@ namespace Multiplayer.Common
             }
         }
 
+        /// <summary>
+        /// Serializes a strongly-typed object into the specified ByteWriter stream using this instance context.
+        /// </summary>
+        /// <typeparam name="T">Object type.</typeparam>
+        /// <param name="data">Target network buffer.</param>
+        /// <param name="obj">Object instance to write.</param>
         public void WriteSync<T>(ByteWriter data, T? obj)
         {
             WriteSyncObject(data, obj, typeof(T));
         }
 
+        /// <summary>
+        /// Serializes an arbitrary object instance into the network buffer.
+        /// Employs cached FieldInfo reflection lookups for ValueTuples to prevent reflection metadata allocation spikes.
+        /// </summary>
         public void WriteSyncObject(ByteWriter data, object? obj, SyncType syncType)
         {
             Type type = syncType.type;
@@ -417,8 +476,8 @@ namespace Multiplayer.Common
                         throw new SerializationException($"Tried to serialize a {elementType}[] with too many ({arr.Length}) items.");
 
                     data.WriteUShort((ushort)arr.Length);
-                    foreach (object e in arr)
-                        WriteSyncObject(data, e, elementType);
+                    for (int i = 0; i < arr.Length; i++)
+                        WriteSyncObject(data, arr.GetValue(i), elementType);
 
                     return;
                 }
@@ -442,8 +501,8 @@ namespace Multiplayer.Common
                             throw new SerializationException($"Tried to serialize a {type} with too many ({list.Count}) items.");
 
                         data.WriteUShort((ushort)list.Count);
-                        foreach (object e in list)
-                            WriteSyncObject(data, e, listObjType);
+                        for (int i = 0; i < list.Count; i++)
+                            WriteSyncObject(data, list[i], listObjType);
 
                         return;
                     }
@@ -508,8 +567,14 @@ namespace Multiplayer.Common
                     {
                         Type[] arguments = type.GetGenericArguments();
 
-                        WriteSyncObject(data, AccessTools.DeclaredField(type, "Item1").GetValue(obj), arguments[0]);
-                        WriteSyncObject(data, AccessTools.DeclaredField(type, "Item2").GetValue(obj), arguments[1]);
+                        if (!ValueTupleFieldCache.TryGetValue(type, out var fields))
+                        {
+                            fields = (AccessTools.DeclaredField(type, "Item1"), AccessTools.DeclaredField(type, "Item2"));
+                            ValueTupleFieldCache[type] = fields;
+                        }
+
+                        WriteSyncObject(data, fields.item1.GetValue(obj), arguments[0]);
+                        WriteSyncObject(data, fields.item2.GetValue(obj), arguments[1]);
 
                         return;
                     }
@@ -528,8 +593,9 @@ namespace Multiplayer.Common
                     }
                 }
 
-                foreach (var hook in serializationHooks)
+                for (int i = 0; i < serializationHooks.Count; i++)
                 {
+                    var hook = serializationHooks[i];
                     if (hook.Item1(syncType))
                     {
                         hook.Item3(data, obj, syncType);

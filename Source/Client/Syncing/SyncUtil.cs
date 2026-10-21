@@ -17,6 +17,7 @@ namespace Multiplayer.Client
         public static List<object> prevSelected = null;
         public static List<WorldObject> prevWorldSelected = null;
         public static bool isDialogNodeTreeOpen = false;
+        public static readonly List<ISelectable> TmpSelectableList = new(16);
 
         internal static void DialogNodeTreePostfix()
         {
@@ -34,6 +35,12 @@ namespace Multiplayer.Client
             Multiplayer.harmony.PatchMeasure(method, transpiler: SyncTemplates.CreateTranspiler());
         }
 
+        /// <summary>
+        /// Deserializes and applies contextual state before dispatching the synchronized command to its handler.
+        /// Replaces LINQ Cast and AllNotNull calls with pre-sized loops to prevent heap churning during command execution.
+        /// </summary>
+        /// <param name="data">Source ByteReader stream.</param>
+        /// <returns>Executed SyncHandler instance.</returns>
         public static SyncHandler HandleCmd(ByteReader data)
         {
             int syncId = data.ReadInt32();
@@ -76,13 +83,31 @@ namespace Multiplayer.Client
                     if (handler.context.HasFlag(SyncContext.MapSelected))
                     {
                         List<ISelectable> selected = SyncSerialization.ReadSync<List<ISelectable>>(data);
-                        Find.Selector.selected = selected.Cast<object>().AllNotNull().ToList();
+                        var targetList = new List<object>(selected != null ? selected.Count : 0);
+                        if (selected != null)
+                        {
+                            for (int i = 0; i < selected.Count; i++)
+                            {
+                                if (selected[i] is object obj)
+                                    targetList.Add(obj);
+                            }
+                        }
+                        Find.Selector.selected = targetList;
                     }
 
                     if (handler.context.HasFlag(SyncContext.WorldSelected))
                     {
                         List<ISelectable> selected = SyncSerialization.ReadSync<List<ISelectable>>(data);
-                        FieldRefs.worldSelected(worldSelector) = selected.Cast<WorldObject>().AllNotNull().ToList();
+                        var targetList = new List<WorldObject>(selected != null ? selected.Count : 0);
+                        if (selected != null)
+                        {
+                            for (int i = 0; i < selected.Count; i++)
+                            {
+                                if (selected[i] is WorldObject wo)
+                                    targetList.Add(wo);
+                            }
+                        }
+                        FieldRefs.worldSelected(worldSelector) = targetList;
 
                         // Some world gizmos only read the selected tile (e.g. the dev "Generate settlement")
                         restoreWorldTile = true;
@@ -115,6 +140,46 @@ namespace Multiplayer.Client
             return handler;
         }
 
+        /// <summary>
+        /// Populates the reusable selectable buffer without allocating LINQ Cast iterators.
+        /// </summary>
+        private static List<ISelectable> GetSelectableList(List<object> source)
+        {
+            TmpSelectableList.Clear();
+            if (source != null)
+            {
+                for (int i = 0; i < source.Count; i++)
+                {
+                    if (source[i] is ISelectable sel)
+                        TmpSelectableList.Add(sel);
+                }
+            }
+            return TmpSelectableList;
+        }
+
+        /// <summary>
+        /// Populates the reusable selectable buffer from world objects without allocations.
+        /// </summary>
+        private static List<ISelectable> GetWorldSelectableList(List<WorldObject> source)
+        {
+            TmpSelectableList.Clear();
+            if (source != null)
+            {
+                for (int i = 0; i < source.Count; i++)
+                {
+                    if (source[i] is ISelectable sel)
+                        TmpSelectableList.Add(sel);
+                }
+            }
+            return TmpSelectableList;
+        }
+
+        /// <summary>
+        /// Writes contextual command metadata (map coordinates, selections, orders) to the network stream.
+        /// Uses indexed buffering to eliminate per-command LINQ Cast and ToList allocations.
+        /// </summary>
+        /// <param name="handler">SyncHandler defining the required context flags.</param>
+        /// <param name="data">Destination ByteWriter stream.</param>
         public static void WriteContext(SyncHandler handler, ByteWriter data)
         {
             if (handler.context == SyncContext.None) return;
@@ -129,11 +194,11 @@ namespace Multiplayer.Client
             }
 
             if (handler.context.HasFlag(SyncContext.MapSelected))
-                SyncSerialization.WriteSync(data, Find.Selector.selected.Cast<ISelectable>().ToList());
+                SyncSerialization.WriteSync(data, GetSelectableList(Find.Selector.selected));
 
             if (handler.context.HasFlag(SyncContext.WorldSelected))
             {
-                SyncSerialization.WriteSync(data, Find.WorldSelector.selected.Cast<ISelectable>().ToList());
+                SyncSerialization.WriteSync(data, GetWorldSelectableList(Find.WorldSelector.selected));
                 SyncSerialization.WriteSync(data, Find.WorldSelector.selectedTile);
                 SyncSerialization.WriteSync(data, Find.WorldSelector.selectedLayer);
             }
