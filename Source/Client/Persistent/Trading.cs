@@ -315,7 +315,7 @@ namespace Multiplayer.Client
                 SwitchToMapOrWorld(entry.map);
                 CameraJumper.TryJumpAndSelect(playerNegotiator);
                 Find.WindowStack.Add(new TradingWindow()
-                    { selectedTab = Multiplayer.WorldComp.trading.IndexOf(this) });
+                { selectedTab = Multiplayer.WorldComp.trading.IndexOf(this) });
             });
         }
 
@@ -820,7 +820,19 @@ namespace Multiplayer.Client
     {
         static bool Prefix(Settlement_TraderTracker __instance)
         {
-            return Multiplayer.Client == null || Multiplayer.WorldComp.trading.All(s => s.trader != __instance.settlement);
+            if (Multiplayer.Client == null) return true;
+
+            var sessions = Multiplayer.WorldComp?.trading;
+            if (sessions == null || sessions.Count == 0) return true;
+
+            var settlement = __instance.settlement;
+            for (int i = 0; i < sessions.Count; i++)
+            {
+                if (sessions[i].trader == settlement)
+                    return false;
+            }
+
+            return true;
         }
     }
 

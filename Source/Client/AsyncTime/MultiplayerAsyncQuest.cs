@@ -79,9 +79,6 @@ namespace Multiplayer.Client.Comp
     {
         static IEnumerable<MethodInfo> TargetMethods()
         {
-            yield return AccessTools.PropertyGetter(typeof(Quest), nameof(Quest.TicksSinceAppeared));
-            yield return AccessTools.PropertyGetter(typeof(Quest), nameof(Quest.TicksSinceAccepted));
-            yield return AccessTools.PropertyGetter(typeof(Quest), nameof(Quest.TicksSinceCleanup));
             yield return AccessTools.Method(typeof(Quest), nameof(Quest.SetInitiallyAccepted));
             yield return AccessTools.Method(typeof(Quest), nameof(Quest.CleanupQuestParts));
         }
@@ -98,21 +95,78 @@ namespace Multiplayer.Client.Comp
         static void Finalizer(AsyncTimeComp __state) => __state?.PostContext();
     }
 
-    [HarmonyPatch(typeof(Quest), nameof(Quest.Accept))]
-    static class SetContextForAccept
+    [HarmonyPatch(typeof(Quest), nameof(Quest.TicksSinceAppeared), MethodType.Getter)]
+    static class QuestTicksSinceAppearedPatch
+    {
+        static bool Prefix(Quest __instance, ref int __result)
+        {
+            if (Multiplayer.Client == null || !Multiplayer.GameComp.asyncTime) return true;
+
+            var mapComp = MultiplayerAsyncQuest.TryGetCachedQuestMap(__instance);
+            int currentTicks = mapComp != null ? mapComp.mapTicks : Find.TickManager.TicksGame;
+            __result = currentTicks - __instance.appearanceTick;
+            return false;
+        }
+    }
+
+    [HarmonyPatch(typeof(Quest), nameof(Quest.TicksSinceAccepted), MethodType.Getter)]
+    static class QuestTicksSinceAcceptedPatch
+    {
+        static bool Prefix(Quest __instance, ref int __result)
+        {
+            if (Multiplayer.Client == null || !Multiplayer.GameComp.asyncTime) return true;
+
+            if (__instance.acceptanceTick < 0)
+            {
+                __result = -1;
+                return false;
+            }
+
+            var mapComp = MultiplayerAsyncQuest.TryGetCachedQuestMap(__instance);
+            int currentTicks = mapComp != null ? mapComp.mapTicks : Find.TickManager.TicksGame;
+            __result = currentTicks - __instance.acceptanceTick;
+            return false;
+        }
+    }
+
+    [HarmonyPatch(typeof(Quest), nameof(Quest.TicksSinceCleanup), MethodType.Getter)]
+    static class QuestTicksSinceCleanupPatch
+    {
+        static bool Prefix(Quest __instance, ref int __result)
+        {
+            if (Multiplayer.Client == null || !Multiplayer.GameComp.asyncTime) return true;
+
+            if (__instance.cleanupTick < 0)
+            {
+                __result = -1;
+                return false;
+            }
+
+            var mapComp = MultiplayerAsyncQuest.TryGetCachedQuestMap(__instance);
+            int currentTicks = mapComp != null ? mapComp.mapTicks : Find.TickManager.TicksGame;
+            __result = currentTicks - __instance.cleanupTick;
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Ensures that quest initiation executes within the correct map AsyncTimeComp context.
+    /// Setting context during Quest.Initiate guarantees that generated quest parts, threats,
+    /// and timers are initialized against the target map's tick timeline rather than global world time.
+    /// </summary>
+    [HarmonyPatch(typeof(Quest), nameof(Quest.Initiate))]
+    static class SetContextForInitiate
     {
         static void Prefix(Quest __instance, ref AsyncTimeComp __state)
         {
             if (Multiplayer.Client == null) return;
-
-            //Make sure quest is accepted and async time is enabled and there are parts to this quest
-            if (__instance.State != QuestState.NotYetAccepted || !Multiplayer.GameComp.asyncTime || __instance.parts == null) return;
+            if (!Multiplayer.GameComp.asyncTime || __instance.parts == null) return;
 
             __state = MultiplayerAsyncQuest.CacheQuest(__instance);
             __state?.PreContext();
         }
 
-        static void Finalizer(AsyncTimeComp __state) => __state?.PostContext();
+        static void Postfix(AsyncTimeComp __state) => __state?.PostContext();
     }
 
     [HarmonyPatch(typeof(Quest), nameof(Quest.End))]
@@ -129,6 +183,7 @@ namespace Multiplayer.Client.Comp
     {
         // Reusable buffer for map and world quest lookups
         private static readonly Dictionary<AsyncTimeComp, List<Quest>> mapQuestsCache = [];
+        private static readonly Dictionary<Quest, AsyncTimeComp> questToMapCache = [];
         private static readonly List<Quest> worldQuestsCache = [];
         private static readonly List<Quest> TmpQuestsToTick = new List<Quest>(32);
 
@@ -163,6 +218,9 @@ namespace Multiplayer.Client.Comp
         {
             if (mapQuestsCache.TryGetValue(mapAsyncTimeComp, out var quests))
             {
+                for (int i = 0; i < quests.Count; i++)
+                    questToMapCache.Remove(quests[i]);
+
                 worldQuestsCache.AddRange(quests);
                 return mapQuestsCache.Remove(mapAsyncTimeComp);
             }
@@ -177,6 +235,8 @@ namespace Multiplayer.Client.Comp
         /// <returns>If quest is found in cache</returns>
         public static bool TryRemoveCachedQuest(Quest quest)
         {
+            questToMapCache.Remove(quest);
+
             // Removes every entry: a quest cached twice would be ticked twice per tick
             bool removed = worldQuestsCache.RemoveAll(q => q == quest) > 0;
             foreach (var quests in mapQuestsCache.Values)
@@ -185,14 +245,14 @@ namespace Multiplayer.Client.Comp
         }
 
         /// <summary>
-        /// Attempts to get the MapAsyncTimeComp cached for that quest
+        /// Attempts to get the MapAsyncTimeComp cached for that quest via zero-allocation dictionary lookup.
         /// </summary>
         /// <param name="quest">Quest to find MapAsyncTimeComp for</param>
         /// <returns>MapAsyncTimeComp for that quest or Null if not found</returns>
         public static AsyncTimeComp TryGetCachedQuestMap(Quest quest)
         {
             if (!Multiplayer.GameComp.asyncTime || quest == null) return null;
-            return mapQuestsCache.FirstOrDefault(x => x.Value.Contains(quest)).Key;
+            return questToMapCache.TryGetValue(quest, out var comp) ? comp : null;
         }
 
         /// <summary>
@@ -228,11 +288,12 @@ namespace Multiplayer.Client.Comp
         }
 
         /// <summary>
-        /// Clears all cache for both mapQuestsCache and worldQuestsCache as they are static and requires manually clearing on load
+        /// Clears all cache for both mapQuestsCache, questToMapCache and worldQuestsCache
         /// </summary>
         public static void Reset()
         {
             mapQuestsCache.Clear();
+            questToMapCache.Clear();
             worldQuestsCache.Clear();
         }
 
@@ -257,8 +318,9 @@ namespace Multiplayer.Client.Comp
         }
 
         /// <summary>
-        /// Runs QuestTick() on all quests passed using static reusable buffer to prevent heap allocations.
+        /// Runs QuestTick() on all ongoing quests using a static reusable buffer to eliminate heap allocations.
         /// </summary>
+        /// <param name="quests">Collection of quests to tick.</param>
         private static void TickQuests(List<Quest> quests)
         {
             if (quests == null || quests.Count == 0)
@@ -266,7 +328,13 @@ namespace Multiplayer.Client.Comp
 
             TmpQuestsToTick.Clear();
             for (int i = 0; i < quests.Count; i++)
-                TmpQuestsToTick.Add(quests[i]);
+            {
+                var quest = quests[i];
+                if (quest != null && quest.State == QuestState.Ongoing)
+                {
+                    TmpQuestsToTick.Add(quest);
+                }
+            }
 
             for (int i = 0; i < TmpQuestsToTick.Count; i++)
             {
@@ -319,8 +387,9 @@ namespace Multiplayer.Client.Comp
         /// <param name="quest">Quest for the map</param>
         private static void UpsertQuestMap(AsyncTimeComp mapAsyncTimeComp, Quest quest)
         {
-            //if there is more then one map with the quest something went wrong - removes quest object in case it changes map
             TryRemoveCachedQuest(quest);
+
+            questToMapCache[quest] = mapAsyncTimeComp;
 
             if (mapQuestsCache.TryGetValue(mapAsyncTimeComp, out var quests))
             {

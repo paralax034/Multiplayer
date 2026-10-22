@@ -1,3 +1,4 @@
+using System.Collections.Generic;
 using HarmonyLib;
 using RimWorld;
 using RimWorld.Planet;
@@ -10,6 +11,9 @@ namespace Multiplayer.Client.Factions;
 // The pushes are forced: the world and the maps hold the spectator's data in the world tick.
 static class WorldTickOwnerContext
 {
+    private static readonly Dictionary<Ideo, Faction> IdeoFollowerCache = new(32);
+    private static int lastIdeoCacheTick = -1;
+
     // A map's player faction: its parent's, or else the first player faction (in the faction list) with a humanlike
     // pawn on it. Only synced state is read, so it's the same on every client.
     public static Faction MapOwner(Map map)
@@ -20,21 +24,48 @@ static class WorldTickOwnerContext
         if (IsPlayerFaction(map.ParentFaction))
             return map.ParentFaction;
 
-        foreach (var faction in Find.FactionManager.AllFactionsListForReading)
+        var factions = Find.FactionManager.AllFactionsListForReading;
+        for (int i = 0; i < factions.Count; i++)
+        {
+            var faction = factions[i];
             if (IsPlayerFaction(faction) && map.mapPawns.SpawnedPawnsInFaction(faction).Any(p => p.RaceProps.Humanlike))
                 return faction;
+        }
 
         return null;
     }
 
-    // The first player faction (in the faction list) following the ideo
+    // The first player faction (in the faction list) following the ideo.
+    // Memoized per simulation tick to eliminate O(Ideos * Factions) iteration during IdeoTick.
     public static Faction IdeoFollower(Ideo ideo)
     {
-        foreach (var faction in Find.FactionManager.AllFactionsListForReading)
-            if (IsPlayerFaction(faction) && faction.ideos != null && faction.ideos.Has(ideo))
-                return faction;
+        if (ideo == null)
+            return null;
 
-        return null;
+        int currentTick = Find.TickManager?.TicksGame ?? -1;
+        if (lastIdeoCacheTick != currentTick)
+        {
+            IdeoFollowerCache.Clear();
+            lastIdeoCacheTick = currentTick;
+        }
+
+        if (IdeoFollowerCache.TryGetValue(ideo, out var cached))
+            return cached;
+
+        Faction result = null;
+        var factions = Find.FactionManager.AllFactionsListForReading;
+        for (int i = 0; i < factions.Count; i++)
+        {
+            var faction = factions[i];
+            if (IsPlayerFaction(faction) && faction.ideos != null && faction.ideos.Has(ideo))
+            {
+                result = faction;
+                break;
+            }
+        }
+
+        IdeoFollowerCache[ideo] = result;
+        return result;
     }
 
     private static bool IsPlayerFaction(Faction faction) =>

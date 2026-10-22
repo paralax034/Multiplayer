@@ -38,12 +38,23 @@ namespace Multiplayer.Client.Patches
     [HarmonyPatch(typeof(WorldObject), nameof(WorldObject.UpdateRateTicks), MethodType.Getter)]
     public static class VtrSyncWorldObjectPatch
     {
-        static bool Prefix(ref int __result, WorldObject __instance)
+        private static int lastCacheFrame = -1;
+        private static int cachedVtr = VTRSync.MaximumVtr;
+
+        static bool Prefix(ref int __result)
         {
             if (Multiplayer.Client == null)
                 return true;
 
-            __result = Multiplayer.AsyncWorldTime.VTR;
+            int curFrame = UnityEngine.Time.frameCount;
+            if (lastCacheFrame != curFrame)
+            {
+                lastCacheFrame = curFrame;
+                var worldTime = Multiplayer.AsyncWorldTime;
+                cachedVtr = (worldTime != null && worldTime.CurrentPlayerCount > 0) ? VTRSync.MinimumVtr : VTRSync.MaximumVtr;
+            }
+
+            __result = cachedVtr;
             return false;
         }
     }

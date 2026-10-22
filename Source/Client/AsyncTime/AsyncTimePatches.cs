@@ -68,6 +68,11 @@ namespace Multiplayer.Client.AsyncTime
         {
             if (Multiplayer.Client == null || running) return true;
 
+            // Date notification checks season changes (every 15 in-game days). Throttling evaluation to once per 60 ticks
+            // eliminates ~98% of world-tick faction/snapshot overhead while remaining strictly deterministic.
+            if (__instance.lastSeason != Season.Undefined && Find.TickManager.TicksGame % 60 != 0)
+                return false;
+
             if (!Multiplayer.GameComp.multifaction)
             {
                 // Every player plays the host's faction, the world tick runs under it

@@ -40,7 +40,9 @@ namespace Multiplayer.Client.Desyncs
 
         public static void Postfix()
         {
+            if (ignoreTraces > 0 || tracingFailed || !SupportsDeferredStackTracing) return;
             if (Native.LmfPtr == 0) return;
+            if (!Multiplayer.Ticking && !Multiplayer.ExecutingCmds) return;
 
             // This runs inside Rand and other game code: an exception here would abort the game code on this client
             // only, so never let one escape

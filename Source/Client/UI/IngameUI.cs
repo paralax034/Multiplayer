@@ -34,6 +34,12 @@ namespace Multiplayer.Client
         private static int lastTicks;
         private static int lastTicksMapId;
 
+        private static string cachedChatLabel;
+        private static string cachedChatHotkeyTip;
+        private static int cachedPlayerCount = -1;
+        private static bool cachedHasUnread;
+        private static bool cachedHasDesynced;
+
         static bool Prefix()
         {
             Text.Font = GameFont.Small;
@@ -108,8 +114,8 @@ namespace Multiplayer.Client
             if (Multiplayer.session == null)
                 return;
 
-            foreach (var drawer in widgets)
-                y += drawer(y);
+            for (int i = 0; i < widgets.Count; i++)
+                y += widgets[i](y);
         }
 
         private static float DoChatAndTicksBehind(float y)
@@ -121,7 +127,7 @@ namespace Multiplayer.Client
             var session = Multiplayer.session;
 
             var btnRect = new Rect(x, y, BtnWidth, BtnHeight);
-            // Evaluate desync status using indexed loop to avoid allocating LINQ enumerators on every GUI frame
+
             bool hasDesynced = false;
             var sessionPlayers = session.players;
             for (int i = 0; i < sessionPlayers.Count; i++)
@@ -133,33 +139,66 @@ namespace Multiplayer.Client
                 }
             }
 
-            var chatColor = hasDesynced ? "#ff5555" : "#dddddd";
-            var hasUnread = session.hasUnread ? "*" : "";
-            var chatLabel = $"{"MpChatButton".Translate()} <color={chatColor}>({session.players.Count})</color>{hasUnread}";
+            int playerCount = sessionPlayers.Count;
+            bool hasUnread = session.hasUnread;
+            if (cachedPlayerCount != playerCount || cachedHasUnread != hasUnread || cachedHasDesynced != hasDesynced || cachedChatLabel == null)
+            {
+                var chatColor = hasDesynced ? "#ff5555" : "#dddddd";
+                var unreadMarker = hasUnread ? "*" : "";
+                cachedChatLabel = $"{"MpChatButton".Translate()} <color={chatColor}>({playerCount})</color>{unreadMarker}";
+                cachedPlayerCount = playerCount;
+                cachedHasUnread = hasUnread;
+                cachedHasDesynced = hasDesynced;
+            }
 
-            TooltipHandler.TipRegion(btnRect, "MpChatHotkeyInfo".Translate() + " " + MultiplayerStatic.ToggleChatDef.MainKeyLabel);
+            if (Mouse.IsOver(btnRect))
+            {
+                cachedChatHotkeyTip ??= "MpChatHotkeyInfo".Translate() + " " + MultiplayerStatic.ToggleChatDef.MainKeyLabel;
+                TooltipHandler.TipRegion(btnRect, cachedChatHotkeyTip);
+            }
 
-            if (Widgets.ButtonText(btnRect, chatLabel))
+            if (Widgets.ButtonText(btnRect, cachedChatLabel))
             {
                 ChatWindow.OpenChat();
             }
 
             if (!TickPatch.Simulating)
             {
-                IndicatorInfo(out Color color, out string text, out bool slow);
-
                 var indRect = new Rect(btnRect.x - 25f - 5f + 6f / 2f, btnRect.y + 6f / 2f, 19f, 19f);
                 var biggerRect = new Rect(btnRect.x - 25f - 5f + 2f / 2f, btnRect.y + 2f / 2f, 23f, 23f);
+
+                int behind = TickPatch.tickUntil - TickPatch.Timer;
+                bool slow = behind > 30;
 
                 if (slow && Widgets.ButtonInvisible(biggerRect))
                     TickPatch.SetSimulation(toTickUntil: true, canEsc: true);
 
+                Color color = slow ? new Color(0.9f, 0, 0) : behind > 15 ? Color.yellow : new Color(0.0f, 0.8f, 0.0f);
+
                 Widgets.DrawRectFast(biggerRect, new Color(color.r * 0.6f, color.g * 0.6f, color.b * 0.6f));
                 Widgets.DrawRectFast(indRect, color);
-                TooltipHandler.TipRegion(indRect, new TipSignal(text, 31641624));
+
+                if (Mouse.IsOver(indRect))
+                {
+                    IndicatorInfo(behind, color, slow, out string text);
+                    TooltipHandler.TipRegion(indRect, new TipSignal(text, 31641624));
+                }
             }
 
             return BtnHeight;
+        }
+
+        private static void IndicatorInfo(int behind, Color color, bool slow, out string text)
+        {
+            text = "MpTicksBehind".Translate(behind);
+
+            if (slow)
+            {
+                text += $"\n\n{"MpLowerGameSpeed".Translate()}\n{"MpForceCatchUp".Translate()}";
+            }
+
+            if (!WorldRendererUtility.WorldSelected)
+                text += $"\n\nCurrent map avg TPS: {tps:0.00}";
         }
 
         private static void IndicatorInfo(out Color color, out string text, out bool slow)

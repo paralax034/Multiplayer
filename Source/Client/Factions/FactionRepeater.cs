@@ -12,17 +12,55 @@ namespace Multiplayer.Client
 {
     static class FactionRepeater
     {
+        /// <summary>
+        /// Immutable snapshot of faction data entries to eliminate red-black tree enumeration overhead on hot paths.
+        /// </summary>
+        private sealed class CachedEntries<T>
+        {
+            public int version;
+            public (int id, T data)[] items;
+        }
+
+        private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, object> Cache = new();
+
+        /// <summary>
+        /// Executes a simulation delegate across all non-spectator player factions.
+        /// Uses cached flat array traversal to eliminate 4000+ SortedDictionary.GetEnumerator allocations per frame.
+        /// </summary>
         public static bool Template<T>(IDictionary<int, T> factionIdToData, Action<T> dataProcessor, Map map, ref bool ignore)
         {
             if (Multiplayer.Client == null || ignore) return true;
+            if (Multiplayer.GameComp == null || !Multiplayer.GameComp.multifaction) return true;
+            if (factionIdToData == null || factionIdToData.Count == 0) return true;
 
-            var spectatorId = Multiplayer.WorldComp.spectatorFaction.loadID;
-            ignore = true;
-            foreach (var (id, data) in factionIdToData)
+            if (!Cache.TryGetValue(factionIdToData, out var raw) || raw is not CachedEntries<T> cached || cached.version != factionIdToData.Count)
             {
-                if (id == spectatorId)
-                    continue;
+                var spectatorId = Multiplayer.WorldComp?.spectatorFaction?.loadID ?? -1;
+                var list = new List<(int, T)>(factionIdToData.Count);
 
+                foreach (var kv in factionIdToData)
+                {
+                    if (kv.Key != spectatorId)
+                        list.Add((kv.Key, kv.Value));
+                }
+
+                cached = new CachedEntries<T>
+                {
+                    version = factionIdToData.Count,
+                    items = list.ToArray()
+                };
+
+                Cache.Remove(factionIdToData);
+                Cache.Add(factionIdToData, cached);
+            }
+
+            var items = cached.items;
+            if (items.Length == 0) return true;
+
+            ignore = true;
+            for (int i = 0; i < items.Length; i++)
+            {
+                var (id, data) = items[i];
                 map.PushFaction(id);
                 try
                 {

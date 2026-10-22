@@ -109,8 +109,6 @@ namespace Multiplayer.Client
             PreContext();
             int factionDepth = FactionContext.stack.Count;
 
-            //SimpleProfiler.Start();
-
             try
             {
                 // Like vanilla's DoSingleTick, an exception in one subsystem shouldn't skip the rest of the tick
@@ -128,11 +126,10 @@ namespace Multiplayer.Client
                 mapTicks++;
                 Find.TickManager.ticksGameInt = mapTicks;
 
-                //Either This line or PathFinderPatch can be commented out
-                //ForeCompeleScheduledJobs here can prevent all Multithread Races,
-                //but also force pathfinder to be done before tick runing
-                //PathFinderPatch is the other way try to snapshot everything worker threads are using
-                map.pathFinder.ForceCompleteScheduledJobs();
+                // Handled concurrently via PathFinderPatch snapshot isolation.
+                // In singleplayer/local fallback, force complete any lingering worker handles.
+                if (Multiplayer.Client == null)
+                    map.pathFinder.ForceCompleteScheduledJobs();
 
                 tickListNormal.Tick();
                 tickListRare.Tick();
@@ -202,8 +199,6 @@ namespace Multiplayer.Client
                 Multiplayer.game.sync.TryAddMapRandomState(map.uniqueID, randState);
                 eventCount++;
                 tickingMap = null;
-
-                //SimpleProfiler.Pause();
             }
         }
 

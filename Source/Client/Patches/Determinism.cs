@@ -1044,5 +1044,46 @@ namespace Multiplayer.Client.Patches
         }
     }
 
+    /// <summary>
+    /// Enforces determinism during WorldComponent_LocationGenerator.WorldComponentTick.
+    /// Vanilla RimWorld 1.6 invokes planetLayer.GetHashCode().HashOffset() inside GenTicks.IsTickInterval.
+    /// Because PlanetLayer inherits default System.Object.GetHashCode without overriding it,
+    /// hash offsets diverge across machines in Mono/Unity, causing the host to evaluate location generation
+    /// and consume RNG seeds on ticks where clients skip it entirely.
+    /// Replaces the virtual GetHashCode call with the deterministic PlanetLayer.LayerID.
+    /// </summary>
+    [HarmonyPatch(typeof(WorldComponent_LocationGenerator), nameof(WorldComponent_LocationGenerator.WorldComponentTick))]
+    static class LocationGeneratorDeterminismPatch
+    {
+        static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+        {
+            var targetGetHashCode = AccessTools.Method(typeof(object), nameof(object.GetHashCode));
+            var replacementHash = AccessTools.Method(typeof(LocationGeneratorDeterminismPatch), nameof(GetDeterministicLayerHash));
+            int patched = 0;
+
+            foreach (var ci in instructions)
+            {
+                if (ci.Calls(targetGetHashCode))
+                {
+                    ci.opcode = OpCodes.Call;
+                    ci.operand = replacementHash;
+                    patched++;
+                }
+                yield return ci;
+            }
+
+            if (patched == 0)
+                Log.Error("Multiplayer: Could not find GetHashCode call in WorldComponent_LocationGenerator.WorldComponentTick");
+        }
+
+        public static int GetDeterministicLayerHash(object obj)
+        {
+            if (Multiplayer.Client == null)
+                return obj?.GetHashCode() ?? 0;
+
+            return obj is PlanetLayer layer ? layer.LayerID : 0;
+        }
+    }
+
 
 }
