@@ -27,7 +27,7 @@ namespace Multiplayer.Client.Desyncs
             public string rawPayload;
             public string seed = "0";
             public string entity = "Unknown";
-            public List<string> stack = new();
+            public List<string> stack = [];
         }
 
         /// <summary>
@@ -39,7 +39,7 @@ namespace Multiplayer.Client.Desyncs
             if (string.IsNullOrEmpty(text))
                 return result;
 
-            string[] lines = text.Split(new[] { "\r\n", "\r", "\n" }, StringSplitOptions.None);
+            string[] lines = text.Split(["\r\n", "\r", "\n"], StringSplitOptions.None);
             TraceEntry current = null;
 
             for (int i = 0; i < lines.Length; i++)
@@ -53,9 +53,9 @@ namespace Multiplayer.Client.Desyncs
                         result.Add(current);
 
                     var payload = match.Groups[4].Value.Trim();
-                    var parts = payload.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                    var parts = payload.Split([' '], StringSplitOptions.RemoveEmptyEntries);
 
-                    var seedVal = parts.Length > 0 ? parts[parts.Length - 1] : "0";
+                    var seedVal = parts.Length > 0 ? parts[^1] : "0";
                     var entityName = parts.Length >= 3 ? string.Join(" ", parts, 0, parts.Length - 2) : payload;
 
                     current = new TraceEntry
@@ -86,6 +86,7 @@ namespace Multiplayer.Client.Desyncs
 
         /// <summary>
         /// Generates a comprehensive human-readable forensic report contrasting host and client simulation streams.
+        /// Aligns trace streams using trace sequence IDs to prevent false Step #0 divergence when comparing windowed server slices.
         /// </summary>
         public static string GenerateDiffReport(string hostRawTraces, string clientRawTraces, SaveableDesyncInfo desyncInfo)
         {
@@ -138,54 +139,88 @@ namespace Multiplayer.Client.Desyncs
                 sb.AppendLine($"  Seed:   {entry.seed}");
                 sb.AppendLine($"  Entity: {entry.entity}");
                 sb.AppendLine("  Callstack:");
-                foreach (var line in entry.stack)
-                    sb.AppendLine($"    {line}");
+                for (int i = 0; i < entry.stack.Count; i++)
+                    sb.AppendLine($"    {entry.stack[i]}");
 
                 return sb.ToString();
             }
 
-            // Scan sequentially for the first point of divergence
-            int minLen = Math.Min(host.Count, client.Count);
-            int divergeIdx = -1;
+            // Two-pointer sequential alignment by trace sequence ID.
+            // Eliminates zero-index false positives when host returns an 81-trace radius window around diffAt.
+            int hostPtr = 0;
+            int clientPtr = 0;
+            int commonStepsEvaluated = 0;
 
-            for (int i = 0; i < minLen; i++)
+            TraceEntry divergeHost = null;
+            TraceEntry divergeClient = null;
+            TraceEntry lastMatchingHost = null;
+            TraceEntry lastMatchingClient = null;
+
+            while (hostPtr < host.Count && clientPtr < client.Count)
             {
-                bool stackMismatch = host[i].stack.Count > 0 && client[i].stack.Count > 0 && host[i].stack[0] != client[i].stack[0];
-                if (host[i].tick != client[i].tick || host[i].hash != client[i].hash || stackMismatch)
+                var h = host[hostPtr];
+                var c = client[clientPtr];
+
+                if (h.index < c.index)
                 {
-                    divergeIdx = i;
+                    hostPtr++;
+                    continue;
+                }
+
+                if (c.index < h.index)
+                {
+                    clientPtr++;
+                    continue;
+                }
+
+                // Indices match: evaluate simulation invariants at identical logical step
+                commonStepsEvaluated++;
+
+                bool stackMismatch = h.stack.Count > 0 && c.stack.Count > 0 && h.stack[0] != c.stack[0];
+                bool diverged = h.tick != c.tick || h.hash != c.hash || stackMismatch;
+
+                if (diverged)
+                {
+                    divergeHost = h;
+                    divergeClient = c;
                     break;
                 }
+
+                lastMatchingHost = h;
+                lastMatchingClient = c;
+                hostPtr++;
+                clientPtr++;
             }
 
-            if (divergeIdx == -1)
+            if (commonStepsEvaluated == 0)
             {
-                if (host.Count == client.Count)
-                {
-                    sb.AppendLine("[OK] Trace hashes and call stacks are IDENTICAL within the recorded radius.");
-                    sb.AppendLine("Root cause is likely an unmonitored collection mutation, async thread state, or floating-point divergence.");
-                    return sb.ToString();
-                }
-                divergeIdx = minLen;
+                sb.AppendLine("[!] NOTICE: TRACE INDEX RANGES DO NOT OVERLAP");
+                sb.AppendLine($"Host Index Range:   [{host[0].index} .. {host[^1].index}]");
+                sb.AppendLine($"Client Index Range: [{client[0].index} .. {client[^1].index}]");
+                sb.AppendLine();
+                sb.AppendLine("DIAGNOSIS: Host sent an 81-trace window around an index outside client trace range.");
+                return sb.ToString();
             }
 
-            // Detect asymmetric calls where one side executed extra simulation ticks
+            if (divergeHost == null && divergeClient == null)
+            {
+                sb.AppendLine($"[OK] All {commonStepsEvaluated} overlapping trace steps are IDENTICAL.");
+                sb.AppendLine("Root cause is likely an unmonitored collection mutation, async thread state, or floating-point divergence.");
+                return sb.ToString();
+            }
+
+            // Detect asymmetric execution steps
             bool isHostExtra = false;
             bool isClientExtra = false;
 
-            if (divergeIdx < host.Count - 1 && divergeIdx < client.Count)
-            {
-                if (host[divergeIdx + 1].hash == client[divergeIdx].hash)
-                    isHostExtra = true;
-            }
+            if (hostPtr + 1 < host.Count && host[hostPtr + 1].hash == divergeClient.hash)
+                isHostExtra = true;
+            else if (clientPtr + 1 < client.Count && client[clientPtr + 1].hash == divergeHost.hash)
+                isClientExtra = true;
 
-            if (!isHostExtra && divergeIdx < client.Count - 1 && divergeIdx < host.Count)
-            {
-                if (client[divergeIdx + 1].hash == host[divergeIdx].hash)
-                    isClientExtra = true;
-            }
+            int divergeStep = divergeHost.index;
 
-            sb.AppendLine($"[!] FIRST DIVERGENCE DETECTED AT STEP #{divergeIdx}");
+            sb.AppendLine($"[!] FIRST DIVERGENCE DETECTED AT STEP #{divergeStep}");
             if (isHostExtra)
             {
                 sb.AppendLine("DIAGNOSIS: Extra call on HOST (Host evaluated simulation/RNG code that was skipped on client)");
@@ -200,45 +235,28 @@ namespace Multiplayer.Client.Desyncs
             }
             sb.AppendLine();
 
-            if (divergeIdx > 0 && divergeIdx - 1 < host.Count)
+            if (lastMatchingHost != null)
             {
-                var p = host[divergeIdx - 1];
-                sb.AppendLine($"--- Last Matching Step #{divergeIdx - 1} (Tick {p.tick}) ---");
-                sb.AppendLine($"  Entity: {p.entity} | Seed: {p.seed}");
-                sb.AppendLine($"  Method: {(p.stack.Count > 0 ? p.stack[0] : "N/A")}");
+                sb.AppendLine($"--- Last Matching Step #{lastMatchingHost.index} (Tick {lastMatchingHost.tick}) ---");
+                sb.AppendLine($"  Entity: {lastMatchingHost.entity} | Seed: {lastMatchingHost.seed}");
+                sb.AppendLine($"  Method: {(lastMatchingHost.stack.Count > 0 ? lastMatchingHost.stack[0] : "N/A")}");
                 sb.AppendLine();
             }
 
-            sb.AppendLine($"----------------------- HOST: Step #{divergeIdx} -----------------------");
-            if (divergeIdx < host.Count)
-            {
-                var h = host[divergeIdx];
-                sb.AppendLine($"Tick: {h.tick} | Hash: {h.hash} | Seed: {h.seed}");
-                sb.AppendLine($"Entity: {h.entity}");
-                sb.AppendLine("Callstack:");
-                foreach (var line in h.stack)
-                    sb.AppendLine($"  {line}");
-            }
-            else
-            {
-                sb.AppendLine("  [No trace entry - Host stream ended earlier]");
-            }
+            sb.AppendLine($"----------------------- HOST: Step #{divergeStep} -----------------------");
+            sb.AppendLine($"Tick: {divergeHost.tick} | Hash: {divergeHost.hash} | Seed: {divergeHost.seed}");
+            sb.AppendLine($"Entity: {divergeHost.entity}");
+            sb.AppendLine("Callstack:");
+            for (int i = 0; i < divergeHost.stack.Count; i++)
+                sb.AppendLine($"  {divergeHost.stack[i]}");
             sb.AppendLine();
 
-            sb.AppendLine($"---------------------- CLIENT: Step #{divergeIdx} ----------------------");
-            if (divergeIdx < client.Count)
-            {
-                var c = client[divergeIdx];
-                sb.AppendLine($"Tick: {c.tick} | Hash: {c.hash} | Seed: {c.seed}");
-                sb.AppendLine($"Entity: {c.entity}");
-                sb.AppendLine("Callstack:");
-                foreach (var line in c.stack)
-                    sb.AppendLine($"  {line}");
-            }
-            else
-            {
-                sb.AppendLine("  [No trace entry - Client stream ended earlier]");
-            }
+            sb.AppendLine($"---------------------- CLIENT: Step #{divergeStep} ----------------------");
+            sb.AppendLine($"Tick: {divergeClient.tick} | Hash: {divergeClient.hash} | Seed: {divergeClient.seed}");
+            sb.AppendLine($"Entity: {divergeClient.entity}");
+            sb.AppendLine("Callstack:");
+            for (int i = 0; i < divergeClient.stack.Count; i++)
+                sb.AppendLine($"  {divergeClient.stack[i]}");
 
             sb.AppendLine("================================================================================");
             return sb.ToString();

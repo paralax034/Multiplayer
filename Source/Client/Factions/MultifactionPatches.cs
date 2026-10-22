@@ -26,8 +26,7 @@ public static class MainTabWindow_QuestsDoRowPatch
     {
         if (Multiplayer.Client != null && !Multiplayer.settings.hideOtherPlayersQuests)
         {
-            Faction playerFaction;
-            if (quest.TryGetPlayerFaction(out playerFaction))
+            if (quest.TryGetPlayerFaction(out Faction playerFaction))
             {
                 Rect iconRect = new Rect(rect.x + 2f, rect.y + 2f, 4f, rect.height - 4f);
                 Widgets.DrawBoxSolid(iconRect, playerFaction.Color);
@@ -43,7 +42,7 @@ public static class MainTabWindow_QuestsDoRowPatch
 }
 
 /// <summary>
-/// Filters quest entries in the Quests UI tab so players only see quests belonging to their faction unless God Mode is enabled.
+/// Filters quest entries in the Quests UI tab so players only see quests belonging to their faction when the filter is enabled.
 /// </summary>
 [HarmonyPatch(typeof(MainTabWindow_Quests), nameof(MainTabWindow_Quests.ShouldListNow))]
 public static class MainTabWindow_QuestsShouldListNowPatch
@@ -51,6 +50,9 @@ public static class MainTabWindow_QuestsShouldListNowPatch
     public static bool Prefix(MainTabWindow_Quests __instance, Quest quest, ref bool __result)
     {
         if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction)
+            return true;
+
+        if (!Multiplayer.settings.hideOtherPlayersQuests)
             return true;
 
         // Allow developers and admins to inspect all quests
@@ -73,7 +75,9 @@ public static class MainTabWindow_QuestsShouldListNowPatch
 }
 
 /// <summary>
-/// Blocks player clients from accepting quests assigned to a different player colony.
+/// Controls whether a quest can be accepted by the current client in multifaction mode.
+/// Prevents players from claiming quests explicitly designated for other player factions,
+/// while allowing public and unassigned quests to be accepted freely.
 /// </summary>
 [HarmonyPatch(typeof(QuestUtility), nameof(QuestUtility.CanAcceptQuest))]
 public static class QuestUtilityCanAcceptQuestPatch
@@ -83,15 +87,18 @@ public static class QuestUtilityCanAcceptQuestPatch
         if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction)
             return;
 
+        // God mode bypasses all faction acceptance restrictions
         if (DebugSettings.godMode)
             return;
 
+        // If quest is already unacceptable due to vanilla requirements (e.g. tech level, missing title), preserve the reason
         if (!__result.Accepted)
             return;
 
+        // Only enforce restriction if the quest is explicitly tied to a specific player faction
         if (quest.TryGetPlayerFaction(out Faction questFaction))
         {
-            var myFaction = Multiplayer.RealPlayerFaction;
+            Faction myFaction = Multiplayer.RealPlayerFaction;
             if (myFaction != null && questFaction != null && questFaction != myFaction)
             {
                 __result = new AcceptanceReport("MpCannotAcceptOtherPlayerQuest".Translate(questFaction.Name));
@@ -125,6 +132,69 @@ public static class MainTabWindow_Quests_DoDismissButton_Patch
         }
 
         return true;
+    }
+}
+
+/// <summary>
+/// Provides network-synchronized methods for accepting quests in multiplayer sessions.
+/// Handles pawn selection, reward choices, and faction alignment in multifaction mode.
+/// </summary>
+public static class DevQuestAcceptUtility
+{
+    /// <summary>
+    /// Executes synchronized quest acceptance across all clients.
+    /// Selects default reward choice if available and resolves an appropriate accepting pawn for the player's faction.
+    /// </summary>
+    /// <param name="quest">The quest to accept.</param>
+    /// <param name="selectedAccepter">Specific pawn chosen to accept the quest (e.g. for royal favor), or null for automatic resolution.</param>
+    [SyncMethod]
+    public static void SyncedAcceptQuest(Quest quest, Pawn selectedAccepter)
+    {
+        if (quest == null || quest.State != QuestState.NotYetAccepted)
+            return;
+
+        // Ensure that if the quest has choice parts, at least the primary choice is marked selected
+        var choicePart = quest.PartsListForReading.OfType<QuestPart_Choice>().FirstOrDefault();
+        if (choicePart != null && choicePart.choices.Count > 0 && !choicePart.choiceUsed)
+        {
+            choicePart.Choose(choicePart.choices[0]);
+        }
+
+        // Determine which faction is accepting the quest
+        Faction targetFaction = null;
+        if (quest.TryGetPlayerFaction(out Faction qf))
+        {
+            targetFaction = qf;
+        }
+        else
+        {
+            targetFaction = Multiplayer.RealPlayerFaction ?? Faction.OfPlayer;
+        }
+
+        Pawn accepter = selectedAccepter;
+
+        // If no valid accepter was passed from UI, find the first valid pawn belonging to the accepting faction
+        if (accepter == null || accepter.Faction != targetFaction || !QuestUtility.CanPawnAcceptQuest(accepter, quest))
+        {
+            accepter = PawnsFinder.AllMapsCaravansAndTravellingTransporters_Alive
+                .FirstOrDefault(p => p.Faction == targetFaction && QuestUtility.CanPawnAcceptQuest(p, quest));
+        }
+
+        // Fallback: search any player faction pawn if no specific faction pawn could accept
+        accepter ??= PawnsFinder.AllMapsCaravansAndTravellingTransporters_Alive
+                .FirstOrDefault(p => p.Faction is { IsPlayer: true } && QuestUtility.CanPawnAcceptQuest(p, quest));
+
+        quest.Accept(accepter);
+        quest.dismissed = false;
+    }
+
+    /// <summary>
+    /// Legacy compatibility hook for instant DevMode quest acceptance.
+    /// </summary>
+    [SyncMethod]
+    public static void SyncedDevAccept(Quest quest)
+    {
+        SyncedAcceptQuest(quest, null);
     }
 }
 
@@ -423,15 +493,12 @@ static class PawnChangeRelationGizmo
 
         if (__instance.Faction is { IsPlayer: true } && __instance.Faction != Faction.OfPlayer)
         {
-            if (cachedCommand == null)
+            cachedCommand ??= new Command_Action
             {
-                cachedCommand = new Command_Action
-                {
-                    defaultLabel = "Change faction relation",
-                    icon = MultiplayerStatic.ChangeRelationIcon,
-                    action = OpenChangeRelationMenu
-                };
-            }
+                defaultLabel = "Change faction relation",
+                icon = MultiplayerStatic.ChangeRelationIcon,
+                action = OpenChangeRelationMenu
+            };
 
             yield return cachedCommand;
         }
@@ -758,8 +825,8 @@ static class TakeToBedGuestFactionPatch
 
 
 /// <summary>
-/// Comprehensive security utility for resolving faction ownership of Things, Pawns, Prisoners, Corpses, and Map-level events.
-/// Includes temporal tile-to-faction caching to prevent nested linear scans over maps and world settlements during GUI frames.
+/// Comprehensive security and routing utility for evaluating faction ownership of Things, Pawns, Prisoners, Corpses, and Map-level events in Multifaction mode.
+/// Contains temporal tile-to-faction caching to eliminate repeated linear scans over Maps and World Settlements during UI render loops.
 /// </summary>
 public static class LetterSecurityUtility
 {
@@ -819,25 +886,111 @@ public static class LetterSecurityUtility
     }
 
     /// <summary>
+    /// Resolves the owning player faction for a single GlobalTargetInfo instance.
+    /// Evaluates prisoners, colonists, corpses, world objects, maps, and world tiles in strict priority order.
+    /// </summary>
+    /// <param name="target">The target to inspect.</param>
+    /// <returns>The controlling player faction, or null if none or non-player.</returns>
+    public static Faction GetTargetPlayerFaction(GlobalTargetInfo target)
+    {
+        if (target.HasThing && target.Thing != null)
+        {
+            var thing = target.Thing;
+
+            // 1. Prisoner check takes highest precedence:
+            // A prisoner's Faction is typically hostile/NPC, but HostFaction represents the capturing player faction.
+            // Notifications (diseases, malnutrition, prison breaks) must route exclusively to the captor.
+            if (thing is Pawn pawn && pawn.HostFaction is { IsPlayer: true } hostFac)
+                return hostFac;
+
+            // 2. Direct player pawn or constructed player building ownership.
+            if (thing.Faction is { IsPlayer: true } tf)
+                return tf;
+
+            // 3. Corpse check: evaluate inner pawn to ensure dead colonists and dead prisoners remain properly attributed.
+            if (thing is Corpse corpse && corpse.InnerPawn != null)
+            {
+                if (corpse.InnerPawn.HostFaction is { IsPlayer: true } chf)
+                    return chf;
+                if (corpse.InnerPawn.Faction is { IsPlayer: true } ctf)
+                    return ctf;
+            }
+
+            // 4. Physical map placement: items on the ground, ambient terrain fires, or unowned structures belong to the map owner.
+            if (thing.Map?.ParentFaction is { IsPlayer: true } mf)
+                return mf;
+            if (thing.MapHeld?.ParentFaction is { IsPlayer: true } mhf)
+                return mhf;
+
+            // 5. Despawned tile tracking via memoized cache (e.g. items dropped on world map or travelling pods).
+            if (thing.Tile.Valid)
+                return GetPlayerFactionAtTile(thing.Tile);
+        }
+        else if (target.HasWorldObject && target.WorldObject != null)
+        {
+            var worldObj = target.WorldObject;
+
+            // Direct world object faction (e.g. player Caravan, player Settlement).
+            if (worldObj.Faction is { IsPlayer: true } wf)
+                return wf;
+
+            // World map parent having an active player-owned map.
+            if (worldObj is MapParent { HasMap: true } mp && mp.Map.ParentFaction is { IsPlayer: true } mpf)
+                return mpf;
+        }
+        else if (target.Map?.ParentFaction is { IsPlayer: true } cellMapFac)
+        {
+            // Direct cell target pointing onto a player-owned map.
+            return cellMapFac;
+        }
+        else if (target.Tile.Valid)
+        {
+            // Direct world tile target.
+            return GetPlayerFactionAtTile(target.Tile);
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Extracts the first deterministic owning player faction from a set of LookTargets.
+    /// Used by letter recording to attribute a newly received letter to a specific faction bucket.
+    /// </summary>
+    /// <param name="lookTargets">LookTargets collection from the incoming Letter or Message.</param>
+    /// <returns>First player faction resolved, or null if unassigned/public.</returns>
+    public static Faction ResolveOwnerPlayerFaction(LookTargets lookTargets)
+    {
+        if (lookTargets?.targets == null)
+            return null;
+
+        var targets = lookTargets.targets;
+        for (int i = 0; i < targets.Count; i++)
+        {
+            if (GetTargetPlayerFaction(targets[i]) is { } fac)
+                return fac;
+        }
+
+        return null;
+    }
+
+    /// <summary>
     /// Resolves target affiliation for onscreen messages and audio alerts.
-    /// Handles colonists, prisoners (via HostFaction), corpses, and map-level weather conditions.
+    /// Ensures events referencing another player's colonists, bases, or prisoners do not display on this client.
     /// </summary>
     /// <param name="lookTargets">Target references associated with the notification.</param>
-    /// <param name="faction">Faction against which visibility is evaluated.</param>
+    /// <param name="faction">Faction against which visibility is evaluated (usually Multiplayer.RealPlayerFaction).</param>
     /// <returns>True if the target belongs to or is relevant to the specified faction; otherwise, false.</returns>
     public static bool IsTargetForFaction(LookTargets lookTargets, Faction faction)
     {
         if (faction == null) return true;
         if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction) return true;
 
-        // Fallback for map-level condition alerts without explicit targets (e.g. Flashstorm, Toxic Fallout)
+        // Fallback for map-level condition alerts without explicit targets (e.g. Eclipse, Flashstorm, Toxic Fallout)
         if (lookTargets?.targets == null || lookTargets.targets.Count == 0)
         {
             var mapContext = Multiplayer.MapContext;
             if (mapContext?.ParentFaction is { IsPlayer: true } mapFaction)
-            {
                 return mapFaction == faction;
-            }
 
             return true;
         }
@@ -849,65 +1002,10 @@ public static class LetterSecurityUtility
         for (int i = 0; i < targets.Count; i++)
         {
             var target = targets[i];
-            Faction targetFaction = null;
-
             if (target.HasThing && target.Thing != null)
-            {
                 hasAnyThingTarget = true;
-                var thing = target.Thing;
 
-                // 1. Direct colonist or player structure ownership
-                if (thing.Faction is { IsPlayer: true } tf)
-                {
-                    targetFaction = tf;
-                }
-                // 2. Prisoner check: prisoner faction is enemy, but HostFaction is the captor
-                else if (thing is Pawn pawn && pawn.HostFaction is { IsPlayer: true } hostFac)
-                {
-                    targetFaction = hostFac;
-                }
-                // 3. Corpse check: resolve inner pawn colonist or prisoner status
-                else if (thing is Corpse corpse && corpse.InnerPawn != null)
-                {
-                    if (corpse.InnerPawn.Faction is { IsPlayer: true } ctf)
-                        targetFaction = ctf;
-                    else if (corpse.InnerPawn.HostFaction is { IsPlayer: true } chf)
-                        targetFaction = chf;
-                }
-                // 4. Physical map placement
-                else if (thing.Map?.ParentFaction is { IsPlayer: true } mf)
-                {
-                    targetFaction = mf;
-                }
-                else if (thing.MapHeld?.ParentFaction is { IsPlayer: true } mhf)
-                {
-                    targetFaction = mhf;
-                }
-                // 5. Despawned tile tracking via memoized lookup
-                else if (thing.Tile.Valid)
-                {
-                    targetFaction = GetPlayerFactionAtTile(thing.Tile);
-                }
-            }
-            // World object targets (caravans, sites, settlements)
-            else if (target.HasWorldObject && target.WorldObject != null)
-            {
-                var worldObj = target.WorldObject;
-                if (worldObj.Faction is { IsPlayer: true } wf)
-                {
-                    targetFaction = wf;
-                }
-                else if (worldObj is Caravan caravan && caravan.Faction is { IsPlayer: true } cf)
-                {
-                    targetFaction = cf;
-                }
-            }
-            // Target points directly to a cell on a player-owned map
-            else if (target.Map?.ParentFaction is { IsPlayer: true } cellMapFac)
-            {
-                targetFaction = cellMapFac;
-            }
-
+            Faction targetFaction = GetTargetPlayerFaction(target);
             if (targetFaction != null)
             {
                 hasAnyPlayerAffiliation = true;
@@ -916,10 +1014,9 @@ public static class LetterSecurityUtility
             }
         }
 
+        // If targets are concrete Things (e.g. wild animal on another map) and neither belongs to the local player, suppress it
         if (hasAnyThingTarget && !hasAnyPlayerAffiliation)
-        {
             return false;
-        }
 
         return !hasAnyPlayerAffiliation;
     }
@@ -936,76 +1033,27 @@ public static class LetterSecurityUtility
         if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction) return true;
         if (let == null) return false;
 
-        // Quests have explicit faction bounds
+        // 1. Quests have explicit player faction bounds
         if (let is ChoiceLetter choiceLetter && choiceLetter.quest != null)
         {
             if (choiceLetter.quest.TryGetPlayerFaction(out Faction questFaction))
                 return questFaction == faction;
         }
 
-        // Target locations override generic relatedFaction
+        // 2. Concrete targets override generic relatedFaction fields
         if (let.lookTargets?.targets != null && let.lookTargets.targets.Count > 0)
-        {
             return IsTargetForFaction(let.lookTargets, faction);
-        }
 
-        // Direct faction association
+        // 3. Direct faction association
         if (let.relatedFaction is { IsPlayer: true } relatedFac)
-        {
             return relatedFac == faction;
-        }
 
-        // Map context fallback for weather and ambient incidents
+        // 4. Map context fallback for weather and ambient incidents
         var mapContext = Multiplayer.MapContext;
         if (mapContext?.ParentFaction is { IsPlayer: true } mapFaction)
-        {
             return mapFaction == faction;
-        }
 
         return true;
-    }
-}
-
-/// <summary>
-/// Silences camera audio cue for incoming letters belonging to other factions.
-/// </summary>
-[HarmonyPatch(typeof(LetterStack), nameof(LetterStack.ReceiveLetter), typeof(Letter), typeof(string), typeof(int), typeof(bool))]
-static class LetterStackReceiveSoundOnlyMyFaction
-{
-    private static readonly MethodInfo PlayOneShotOnCamera =
-        AccessTools.Method(typeof(SoundStarter), nameof(SoundStarter.PlayOneShotOnCamera), new[] { typeof(SoundDef), typeof(Map) });
-    private static readonly MethodInfo ReplacementMethod =
-        AccessTools.Method(typeof(LetterStackReceiveSoundOnlyMyFaction), nameof(PlaySoundReplacement));
-
-    static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> insts)
-    {
-        foreach (var inst in insts)
-        {
-            if (inst.Calls(PlayOneShotOnCamera))
-            {
-                yield return new CodeInstruction(OpCodes.Ldarg_1); // Pass Letter argument
-                yield return new CodeInstruction(OpCodes.Call, ReplacementMethod);
-            }
-            else
-            {
-                yield return inst;
-            }
-        }
-    }
-
-    static void PlaySoundReplacement(SoundDef sound, Map map, Letter let)
-    {
-        if (sound == null) return;
-        if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction)
-        {
-            sound.PlayOneShotOnCamera(map);
-            return;
-        }
-
-        if (LetterSecurityUtility.IsLetterForFaction(let, Multiplayer.RealPlayerFaction))
-        {
-            sound.PlayOneShotOnCamera(map);
-        }
     }
 }
 
@@ -1072,7 +1120,8 @@ static class MessagesDoGUIFilterPatch
 }
 
 /// <summary>
-/// Suppresses audio beeps for messages belonging to other factions.
+/// Attaches active MapContext or Faction context to targetless messages (e.g. GameCondition Eclipse start/end)
+/// when they are created during simulation ticks, and suppresses audio cues for other factions.
 /// </summary>
 [HarmonyPatch(typeof(Messages), nameof(Messages.Message), typeof(Message), typeof(bool))]
 static class MessagesSoundFilterPatch
@@ -1081,6 +1130,23 @@ static class MessagesSoundFilterPatch
         AccessTools.Method(typeof(SoundStarter), nameof(SoundStarter.PlayOneShotOnCamera), new[] { typeof(SoundDef), typeof(Map) });
     private static readonly MethodInfo ReplacementMethod =
         AccessTools.Method(typeof(MessagesSoundFilterPatch), nameof(PlayMessageSoundReplacement));
+
+    static void Prefix(Message msg)
+    {
+        if (Multiplayer.Client == null || Multiplayer.game == null || !Multiplayer.GameComp.multifaction || msg == null)
+            return;
+
+        if (msg.lookTargets?.targets == null || msg.lookTargets.targets.Count == 0)
+        {
+            if (Multiplayer.MapContext is { } map)
+            {
+                if (map.Parent != null && map.Parent.Spawned)
+                    msg.lookTargets = new LookTargets(map.Parent);
+                else if (map.Tile.Valid)
+                    msg.lookTargets = new LookTargets(map.Tile);
+            }
+        }
+    }
 
     static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> insts)
     {

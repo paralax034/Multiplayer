@@ -4,6 +4,7 @@ using System.Linq;
 using System.Reflection;
 using System.Reflection.Emit;
 using HarmonyLib;
+using Multiplayer.Client.Factions;
 using RimWorld;
 using UnityEngine;
 using Verse;
@@ -31,12 +32,33 @@ namespace Multiplayer.Client.Patches
             if (letterFactions == null || letterFactions.ContainsKey(let.ID))
                 return;
 
-            // Priority: explicit related faction -> active player context -> map owner fallback
-            Faction receivingFaction = let.relatedFaction is { IsPlayer: true } rf
-                ? rf
-                : (Faction.OfPlayer != null && Faction.OfPlayer != Multiplayer.WorldComp?.spectatorFaction
-                    ? Faction.OfPlayer
-                    : Multiplayer.MapContext?.ParentFaction);
+            Faction receivingFaction = null;
+
+            // 1. Quests explicit player faction
+            if (let is ChoiceLetter { quest: { } quest } && quest.TryGetPlayerFaction(out Faction qf))
+            {
+                receivingFaction = qf;
+            }
+            // 2. Specific target ownership (colonists, prisoners via HostFaction, corpses, map parent)
+            else if (LetterSecurityUtility.ResolveOwnerPlayerFaction(let.lookTargets) is { } targetFac)
+            {
+                receivingFaction = targetFac;
+            }
+            // 3. Explicit related player faction
+            else if (let.relatedFaction is { IsPlayer: true } rf && rf != Multiplayer.WorldComp?.spectatorFaction)
+            {
+                receivingFaction = rf;
+            }
+            // 4. Map owner fallback if ticking a player-owned map
+            else if (Multiplayer.MapContext?.ParentFaction is { IsPlayer: true } mapFac && mapFac != Multiplayer.WorldComp?.spectatorFaction)
+            {
+                receivingFaction = mapFac;
+            }
+            // 5. Active simulation Faction.OfPlayer context
+            else if (Faction.OfPlayer != null && Faction.OfPlayer != Multiplayer.WorldComp?.spectatorFaction)
+            {
+                receivingFaction = Faction.OfPlayer;
+            }
 
             if (receivingFaction != null)
                 letterFactions[let.ID] = receivingFaction.loadID;
@@ -46,14 +68,20 @@ namespace Multiplayer.Client.Patches
         {
             if (!Active || let == null) return true;
 
-            var worldComp = Multiplayer.game.worldComp;
-            if (worldComp == null) return true;
+            var myFaction = Multiplayer.RealPlayerFaction;
+            if (myFaction == null) return true;
 
-            // Check recorded ID map first
-            if (worldComp.letterFactions.TryGetValue(let.ID, out var factionId))
+            // Always verify explicit target ownership first (prisoners, pawns, maps)
+            if (LetterSecurityUtility.ResolveOwnerPlayerFaction(let.lookTargets) is { } targetOwner)
+                return targetOwner == myFaction;
+
+            if (let is ChoiceLetter { quest: { } quest } && quest.TryGetPlayerFaction(out Faction questFac))
+                return questFac == myFaction;
+
+            var worldComp = Multiplayer.game.worldComp;
+            if (worldComp != null && worldComp.letterFactions.TryGetValue(let.ID, out var factionId))
             {
-                var myFactionId = Multiplayer.RealPlayerFaction?.loadID;
-                if (factionId == myFactionId)
+                if (factionId == myFaction.loadID)
                     return true;
 
                 // If recorded under a specific other player faction, strictly hide
@@ -61,8 +89,7 @@ namespace Multiplayer.Client.Patches
                     return false;
             }
 
-            // Fall back to comprehensive target and prisoner inspection
-            return LetterSecurityUtility.IsLetterForFaction(let, Multiplayer.RealPlayerFaction);
+            return LetterSecurityUtility.IsLetterForFaction(let, myFaction);
         }
     }
 
@@ -76,9 +103,20 @@ namespace Multiplayer.Client.Patches
         {
             if (Multiplayer.Client == null) return;
 
+            // Record before ReceiveLetter in case arrival sound checks visibility during ReceiveLetter
             MultifactionLetters.RecordReceivingFaction(let);
             __state = receiving;
             receiving = let;
+        }
+
+        static void Postfix(Letter let)
+        {
+            if (Multiplayer.Client == null) return;
+
+            // Vanilla ReceiveLetter assigns let.ID = Find.UniqueIDsManager.GetNextLetterID() inside the method body.
+            // Recording again in Postfix ensures the final assigned let.ID is mapped to the receiving faction
+            // for targetless letters (e.g. Bossgroup incoming alerts).
+            MultifactionLetters.RecordReceivingFaction(let);
         }
 
         static void Finalizer(Letter __state)
@@ -155,14 +193,66 @@ namespace Multiplayer.Client.Patches
         }
     }
 
+    /// <summary>
+    /// Synchronizes letter removal across all clients when a player dismisses a letter in the UI,
+    /// while protecting Biotech growth moment choice dialogs and updating GUI filter buffers.
+    /// </summary>
     [HarmonyPatch(typeof(LetterStack), nameof(LetterStack.RemoveLetter))]
     static class LetterStackRemoveDuringFilteredGUI
     {
+        static bool Prefix(Letter let)
+        {
+            if (Multiplayer.Client == null || let == null)
+                return true;
+
+            // Biotech safeguard: The button to apply choices from Dialog_GrowthMomentChoices closes the letter
+            // immediately, sending it to the archive. In MP, the sync engine must keep the letter in the active stack
+            // so other clients can resolve it. Suppress removal while this specific window is rendering.
+            if (IsDrawingGrowthMomentDialog.isDrawing)
+                return false;
+
+            // When a player dismisses a letter via UI (right click on letter stack or clicking close on a dialog),
+            // synchronize the removal to all clients. Otherwise, the letter remains in the simulation letter stack
+            // on the host/server, causing all dismissed letters (50+) to reappear upon save reloading or faction joining.
+            // Guarded by (!Multiplayer.Ticking && !Multiplayer.ExecutingCmds) so natural expirations and synced command
+            // executions do not emit recursive network packets.
+            if (Multiplayer.ShouldSync && !Multiplayer.Ticking && !Multiplayer.ExecutingCmds && let.ID >= 0)
+            {
+                SyncedRemoveLetter(let.ID);
+                return false;
+            }
+
+            return true;
+        }
+
         static void Postfix(LetterStack __instance, Letter let)
         {
-            // Removed from the drawn list (e.g. dismissed with right click), remove it from the actual one too
+            // If the letter was removed from the active filtered GUI list (LettersOnGUIOnlyMyFaction),
+            // ensure it is also purged from the underlying realLetters backing list so it is not restored in the Finalizer.
             if (LettersOnGUIOnlyMyFaction.realLetters != null && !__instance.letters.Contains(let))
                 LettersOnGUIOnlyMyFaction.realLetters.Remove(let);
+        }
+
+        /// <summary>
+        /// Synchronized network command to purge a dismissed letter from LetterStack on all connected clients.
+        /// Uses global::Multiplayer.API to prevent namespace resolution collision with Multiplayer.Client.Multiplayer class.
+        /// </summary>
+        /// <param name="letterId">Unique persistent ID of the letter to remove.</param>
+        [global::Multiplayer.API.SyncMethodAttribute]
+        static void SyncedRemoveLetter(int letterId)
+        {
+            var stack = Find.LetterStack;
+            if (stack?.letters == null) return;
+
+            var realList = LettersOnGUIOnlyMyFaction.realLetters ?? stack.letters;
+            for (int i = realList.Count - 1; i >= 0; i--)
+            {
+                if (realList[i].ID == letterId)
+                {
+                    stack.RemoveLetter(realList[i]);
+                    break;
+                }
+            }
         }
     }
 
@@ -339,16 +429,6 @@ namespace Multiplayer.Client.Patches
 
             return true;
         }
-    }
-
-    // The button to apply the choices from growth moment dialog will close the letter right after applying the changes, which puts it into archive.
-    // When reading sync data we check for the letter in the letter stack, and not archive - which fails to read the letter.
-    [HarmonyPatch(typeof(LetterStack), nameof(LetterStack.RemoveLetter))]
-    static class DontRemoveGrowthMomentLetter
-    {
-        static bool Prefix(Letter let) =>
-            Multiplayer.Client == null ||
-            !IsDrawingGrowthMomentDialog.isDrawing;
     }
 
     [HarmonyPatch(typeof(Dialog_GrowthMomentChoices), nameof(Dialog_GrowthMomentChoices.DoWindowContents))]

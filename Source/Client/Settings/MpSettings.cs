@@ -33,10 +33,10 @@ namespace Multiplayer.Client
         public bool showMainMenuAnim = true;
         public DesyncTracingMode desyncTracingMode = DesyncTracingMode.Fast;
         public bool transparentPlayerCursors = true;
-        public List<ColorRGBClient> playerColors = new(DefaultPlayerColors);
+        public List<ColorRGBClient> playerColors = [.. DefaultPlayerColors];
 
         public bool hideOtherPlayersInColonistBar = false;
-        public bool hideOtherPlayersQuests = false;
+        public bool hideOtherPlayersQuests = true;
 
 
         internal static readonly ColorRGBClient[] DefaultPlayerColors =
@@ -80,10 +80,10 @@ namespace Multiplayer.Client
             Scribe_Values.Look(ref appendNameToAutosave, "appendNameToAutosave");
             Scribe_Values.Look(ref transparentPlayerCursors, "transparentPlayerCursors", true);
             Scribe_Values.Look(ref hideOtherPlayersInColonistBar, "hideOtherPlayersInColonistBar");
-            Scribe_Values.Look(ref hideOtherPlayersQuests, "hideOtherPlayersQuests");
+            Scribe_Values.Look(ref hideOtherPlayersQuests, "hideOtherPlayersQuests", true);
 
             Scribe_Collections.Look(ref playerColors, "playerColors", LookMode.Deep);
-            if (playerColors.NullOrEmpty()) playerColors = [..DefaultPlayerColors];
+            if (playerColors.NullOrEmpty()) playerColors = [.. DefaultPlayerColors];
             if (Scribe.mode == LoadSaveMode.PostLoadInit)
                 PlayerManager.PlayerColors = playerColors.Select(c => (ColorRGB)c).ToArray();
 

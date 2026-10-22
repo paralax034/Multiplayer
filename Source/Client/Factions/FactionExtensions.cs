@@ -152,11 +152,54 @@ public static class FactionExtensions
 
     public static bool TryGetPlayerFaction(this Quest quest, out Faction faction)
     {
-        faction = quest.QuestLookTargets
-            .Where(t => t.HasWorldObject && t.WorldObject is Settlement)
-            .Select(t => ((Settlement)t.WorldObject).Faction)
-            .FirstOrDefault(f => f != null);
+        faction = null;
+        if (quest == null)
+            return false;
 
-        return faction != null;
+        foreach (var target in quest.QuestLookTargets)
+        {
+            if (target.HasWorldObject && target.WorldObject != null)
+            {
+                if (target.WorldObject.Faction is { IsPlayer: true } wf)
+                {
+                    faction = wf;
+                    return true;
+                }
+
+                if (target.WorldObject is MapParent { HasMap: true } mp && mp.Map.ParentFaction is { IsPlayer: true } mpf)
+                {
+                    faction = mpf;
+                    return true;
+                }
+            }
+            else if (target.HasThing && target.Thing != null)
+            {
+                var thing = target.Thing;
+                if (thing.Faction is { IsPlayer: true } tf)
+                {
+                    faction = tf;
+                    return true;
+                }
+
+                if (thing is Pawn { HostFaction: { IsPlayer: true } hf })
+                {
+                    faction = hf;
+                    return true;
+                }
+
+                if (thing.MapHeld?.ParentFaction is { IsPlayer: true } mf)
+                {
+                    faction = mf;
+                    return true;
+                }
+            }
+            else if (target.Map?.ParentFaction is { IsPlayer: true } cellMapFac)
+            {
+                faction = cellMapFac;
+                return true;
+            }
+        }
+
+        return false;
     }
 }

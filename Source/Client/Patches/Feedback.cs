@@ -175,6 +175,11 @@ namespace Multiplayer.Client.Patches
             TickPatch.currentExecutingCmdIssuedBySelf;
     }
 
+    /// <summary>
+    /// Intercepts camera jump and selection methods to prevent remote players from hijacking the local camera.
+    /// Filters out jumps occurring during simulation fast-forwarding, during commands executed by other players,
+    /// or during tick processing for other player factions in Multifaction mode.
+    /// </summary>
     [HarmonyPatch]
     static class NoCameraJumpingDuringSimulating
     {
@@ -182,9 +187,72 @@ namespace Multiplayer.Client.Patches
         {
             yield return AccessTools.Method(typeof(CameraJumper), nameof(CameraJumper.TrySelect));
             yield return AccessTools.Method(typeof(CameraJumper), nameof(CameraJumper.TryJumpAndSelect));
-            yield return AccessTools.Method(typeof(CameraJumper), nameof(CameraJumper.TryJump), new[] {typeof(GlobalTargetInfo), typeof(CameraJumper.MovementMode)});
+            yield return AccessTools.Method(typeof(CameraJumper), nameof(CameraJumper.TryJump), new[] { typeof(GlobalTargetInfo), typeof(CameraJumper.MovementMode) });
         }
-        static bool Prefix() => !TickPatch.Simulating;
+
+        static bool Prefix(GlobalTargetInfo target)
+        {
+            // Never jump camera during catch-up simulation (reconnect / join point loading)
+            if (TickPatch.Simulating)
+                return false;
+
+            if (Multiplayer.Client == null)
+                return true;
+
+            // Block camera jumps initiated by a synchronized command that was issued by another player.
+            // Example: Another player clicks 'Settle', 'Setup camp', or calls a shuttle permit.
+            if (Multiplayer.ExecutingCmds && !TickPatch.currentExecutingCmdIssuedBySelf)
+                return false;
+
+            // In multifaction mode, block simulation-driven camera jumps (e.g. caravan entering/exiting map,
+            // quest parts triggering camera cutscenes, or map generation long events) if they belong to another faction.
+            if (Multiplayer.GameComp.multifaction && !Multiplayer.InInterface)
+            {
+                var myFaction = Multiplayer.RealPlayerFaction;
+                if (myFaction != null)
+                {
+                    // Block if the active simulation context is explicitly evaluating another player's faction
+                    if (Faction.OfPlayer != null && Faction.OfPlayer.IsPlayer && Faction.OfPlayer != myFaction)
+                        return false;
+
+                    // Block if the target entity/location does not belong to the local player's faction
+                    if (target.IsValid && !LetterSecurityUtility.IsTargetForFaction(new LookTargets(target), myFaction))
+                        return false;
+                }
+            }
+
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Prevents remote commands or background simulation ticks from forcing the camera to switch to the World view.
+    /// </summary>
+    [HarmonyPatch(typeof(CameraJumper), nameof(CameraJumper.TryShowWorld))]
+    static class CancelTryShowWorldForOtherFactions
+    {
+        static bool Prefix()
+        {
+            if (TickPatch.Simulating)
+                return false;
+
+            if (Multiplayer.Client == null)
+                return true;
+
+            // Block if another player issued a command that attempts to show the world map
+            if (Multiplayer.ExecutingCmds && !TickPatch.currentExecutingCmdIssuedBySelf)
+                return false;
+
+            // Block if a background simulation tick for another player faction attempts to open world view
+            if (Multiplayer.GameComp.multifaction && !Multiplayer.InInterface)
+            {
+                var myFaction = Multiplayer.RealPlayerFaction;
+                if (myFaction != null && Faction.OfPlayer != null && Faction.OfPlayer.IsPlayer && Faction.OfPlayer != myFaction)
+                    return false;
+            }
+
+            return true;
+        }
     }
 
     [HarmonyPatch(typeof(Selector), nameof(Selector.Deselect))]

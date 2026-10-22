@@ -421,10 +421,17 @@ namespace Multiplayer.Client
         static bool Prefix(Pawn_PlayerSettings __instance, Area value) => __instance.AreaRestrictionInPawnCurrentMap != value;
     }
 
+    /// <summary>
+    /// Synchronizes quest acceptance choices and direct quest acceptance across all multiplayer clients.
+    /// Intercepts both reward choice selections in DoRewards and direct clicks on the Accept button in DoAcceptButton.
+    /// </summary>
     [HarmonyPatch]
     static class PatchQuestChoices
     {
-        // It's the only method with a Choice
+        /// <summary>
+        /// Locates the compiler-generated anonymous method in MainTabWindow_Quests that holds the localChoice variable.
+        /// This method is invoked when a player clicks a specific reward choice button.
+        /// </summary>
         static MethodBase TargetMethod()
         {
             return AccessTools.FirstMethod(
@@ -433,6 +440,10 @@ namespace Multiplayer.Client
                 ), m => !m.IsConstructor);
         }
 
+        /// <summary>
+        /// Intercepts reward selection clicks, redirects them to the synchronized Choose method,
+        /// and cancels local non-deterministic execution in the interface context.
+        /// </summary>
         static bool Prefix(QuestPart_Choice.Choice ___localChoice)
         {
             if (Multiplayer.Client == null) return true;
@@ -448,15 +459,56 @@ namespace Multiplayer.Client
                 }
             }
 
-            // Should not happen!
             Log.Error("Multiplayer :: Choice without QuestPart_Choice... you're about to desync.");
             return true;
         }
 
-        // Registered in SyncMethods.cs
+        /// <summary>
+        /// Synchronized network command to register quest reward choice across all connected clients.
+        /// Registered centrally in SyncMethods.Init to avoid duplicate attribute registration.
+        /// </summary>
         internal static void Choose(QuestPart_Choice part, int index)
         {
             part.Choose(part.choices[index]);
+        }
+
+        /// <summary>
+        /// Transpiler patch for MainTabWindow_Quests.DoAcceptButton to intercept both normal
+        /// and DevMode quest acceptance calls, routing them through a synchronized network command.
+        /// </summary>
+        [HarmonyPatch(typeof(MainTabWindow_Quests), nameof(MainTabWindow_Quests.DoAcceptButton))]
+        static class DevAcceptInstantlySyncPatch
+        {
+            static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> instructions)
+            {
+                MethodInfo targetAccept = AccessTools.Method(typeof(Quest), nameof(Quest.Accept), new[] { typeof(Pawn) });
+                MethodInfo replacement = AccessTools.Method(typeof(DevAcceptInstantlySyncPatch), nameof(AcceptOverride));
+
+                foreach (var ci in instructions)
+                {
+                    if (ci.Calls(targetAccept))
+                    {
+                        ci.opcode = OpCodes.Call;
+                        ci.operand = replacement;
+                    }
+                    yield return ci;
+                }
+            }
+
+            /// <summary>
+            /// Overrides local Quest.Accept call inside the UI, ensuring that acceptance
+            /// is dispatched as a synchronized multiplayer command instead of executing un-networked.
+            /// </summary>
+            static void AcceptOverride(Quest quest, Pawn originalPawn)
+            {
+                if (Multiplayer.Client == null)
+                {
+                    quest.Accept(originalPawn);
+                    return;
+                }
+
+                DevQuestAcceptUtility.SyncedAcceptQuest(quest, originalPawn);
+            }
         }
     }
 
