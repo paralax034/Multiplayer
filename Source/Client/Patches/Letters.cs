@@ -194,13 +194,17 @@ namespace Multiplayer.Client.Patches
     }
 
     /// <summary>
-    /// Synchronizes letter removal across all clients when a player dismisses a letter in the UI,
-    /// while protecting Biotech growth moment choice dialogs and updating GUI filter buffers.
+    /// Synchronizes player-initiated letter dismissal across all clients so dismissed letters do not accumulate
+    /// in the host's LetterStack and reappear when switching factions or reloading saves.
+    /// Strict guards (!TickPatch.Simulating, !Multiplayer.dontSync, isSyncingRemoval) prevent CloseLettersDuringSimulating
+    /// or recursive calls from triggering packet storms.
     /// </summary>
     [HarmonyPatch(typeof(LetterStack), nameof(LetterStack.RemoveLetter))]
     static class LetterStackRemoveDuringFilteredGUI
     {
-        static bool Prefix(Letter let)
+        private static bool isSyncingRemoval;
+
+        static bool Prefix(LetterStack __instance, Letter let)
         {
             if (Multiplayer.Client == null || let == null)
                 return true;
@@ -211,14 +215,20 @@ namespace Multiplayer.Client.Patches
             if (IsDrawingGrowthMomentDialog.isDrawing)
                 return false;
 
-            // When a player dismisses a letter via UI (right click on letter stack or clicking close on a dialog),
-            // synchronize the removal to all clients. Otherwise, the letter remains in the simulation letter stack
-            // on the host/server, causing all dismissed letters (50+) to reappear upon save reloading or faction joining.
-            // Guarded by (!Multiplayer.Ticking && !Multiplayer.ExecutingCmds) so natural expirations and synced command
-            // executions do not emit recursive network packets.
-            if (Multiplayer.ShouldSync && !Multiplayer.Ticking && !Multiplayer.ExecutingCmds && let.ID >= 0)
+            // Never intercept if we are already inside SyncedRemoveLetter, or during replay/catch-up simulation
+            // (where CloseLettersDuringSimulating calls RemoveLetter every frame in Update).
+            if (isSyncingRemoval || TickPatch.Simulating || Multiplayer.arbiterInstance)
+                return true;
+
+            // Only synchronize when a human player actively dismisses a synced letter from the interface
+            if (Multiplayer.ShouldSync && let.ID >= 0)
             {
-                SyncedRemoveLetter(let.ID);
+                // Verify the letter actually exists in the stack before sending a command
+                var realList = LettersOnGUIOnlyMyFaction.realLetters ?? __instance.letters;
+                if (realList != null && realList.Contains(let))
+                {
+                    SyncedRemoveLetter(let.ID);
+                }
                 return false;
             }
 
@@ -235,7 +245,7 @@ namespace Multiplayer.Client.Patches
 
         /// <summary>
         /// Synchronized network command to purge a dismissed letter from LetterStack on all connected clients.
-        /// Uses global::Multiplayer.API to prevent namespace resolution collision with Multiplayer.Client.Multiplayer class.
+        /// Suppresses dontSync and sets reentrancy latch to guarantee zero recursive command emission.
         /// </summary>
         /// <param name="letterId">Unique persistent ID of the letter to remove.</param>
         [global::Multiplayer.API.SyncMethodAttribute]
@@ -249,7 +259,18 @@ namespace Multiplayer.Client.Patches
             {
                 if (realList[i].ID == letterId)
                 {
-                    stack.RemoveLetter(realList[i]);
+                    bool prevDontSync = Multiplayer.dontSync;
+                    isSyncingRemoval = true;
+                    Multiplayer.dontSync = true;
+                    try
+                    {
+                        stack.RemoveLetter(realList[i]);
+                    }
+                    finally
+                    {
+                        Multiplayer.dontSync = prevDontSync;
+                        isSyncingRemoval = false;
+                    }
                     break;
                 }
             }

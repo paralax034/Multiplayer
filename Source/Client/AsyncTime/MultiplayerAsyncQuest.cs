@@ -28,15 +28,36 @@ namespace Multiplayer.Client.Comp
         }
     }
 
-    [HarmonyPatch(typeof(QuestGen), nameof(QuestGen.Generate))]
-    static class CacheQuestAfterGeneration
+    /// <summary>
+    /// Caches the generated quest into its target time domain (map or world) and normalizes its initial
+    /// tick timestamps right before QuestGen clears its static working state.
+    /// Running on ClearQuestGenState instead of Generate Postfix guarantees that QuestGen.slate (containing "map")
+    /// and QuestGen.quest are still populated before ClearQuestGenState wipes them in Generate's finally block.
+    /// </summary>
+    [HarmonyPatch(typeof(QuestGen), nameof(QuestGen.ClearQuestGenState))]
+    static class CacheQuestBeforeClearState
     {
-        static void Postfix(ref Quest __result)
+        static void Prefix()
         {
-            if (Multiplayer.Client == null) return;
-            if (!Multiplayer.GameComp.asyncTime) return;
+            if (Multiplayer.Client == null || !Multiplayer.GameComp.asyncTime) return;
 
-            MultiplayerAsyncQuest.CacheQuest(__result);
+            var quest = QuestGen.quest;
+            if (quest == null) return;
+
+            var mapComp = MultiplayerAsyncQuest.CacheQuest(quest);
+            int targetTicks = mapComp != null
+                ? mapComp.mapTicks
+                : (Multiplayer.AsyncWorldTime?.worldTicks ?? Find.TickManager.TicksGame);
+
+            int delta = targetTicks - quest.appearanceTick;
+            if (delta != 0)
+            {
+                quest.appearanceTick += delta;
+                if (quest.acceptanceTick >= 0)
+                    quest.acceptanceTick += delta;
+                if (quest.acceptanceExpireTick >= 0)
+                    quest.acceptanceExpireTick += delta;
+            }
         }
     }
 
@@ -44,7 +65,7 @@ namespace Multiplayer.Client.Comp
     [HarmonyPriority(Priority.Last)]
     static class DisableQuestManagerTickTest
     {
-        static bool Prefix()
+        public static bool Prefix()
         {
             if (Multiplayer.Client == null) return true;
             if (!Multiplayer.GameComp.asyncTime) return true;
@@ -74,45 +95,78 @@ namespace Multiplayer.Client.Comp
         }
     }
 
+    /// <summary>
+    /// Enters the quest's authoritative time domain (target map AsyncTimeComp or world ticks) during
+    /// Quest lifecycle transitions that read Find.TickManager.TicksGame (Accept, SetInitiallyAccepted,
+    /// Initiate, CleanupQuestParts). Prevents QuestPartActivable.Enable from latching mapTicks onto
+    /// a world quest (or vice versa), which previously caused QuestPart_WorldObjectTimeout to expire instantly.
+    /// </summary>
     [HarmonyPatch]
     static class SetContextForQuest
     {
         static IEnumerable<MethodInfo> TargetMethods()
         {
+            yield return AccessTools.Method(typeof(Quest), nameof(Quest.Accept));
             yield return AccessTools.Method(typeof(Quest), nameof(Quest.SetInitiallyAccepted));
+            yield return AccessTools.Method(typeof(Quest), nameof(Quest.Initiate));
             yield return AccessTools.Method(typeof(Quest), nameof(Quest.CleanupQuestParts));
         }
 
-        static void Prefix(Quest __instance, ref AsyncTimeComp __state)
+        static void Prefix(Quest __instance, MethodBase __originalMethod, ref (AsyncTimeComp mapComp, TimeSnapshot? worldSnapshot) __state)
         {
-            if (Multiplayer.Client == null) return;
-            if (!Multiplayer.GameComp.asyncTime) return;
+            if (Multiplayer.Client == null || !Multiplayer.GameComp.asyncTime || __instance == null) return;
 
-            __state = MultiplayerAsyncQuest.TryGetCachedQuestMap(__instance);
-            __state?.PreContext();
+            // If SetInitiallyAccepted runs inside QuestGen.Generate before ClearQuestGenState,
+            // CacheQuestBeforeClearState will normalize acceptanceTick once all parts and slate vars are finalized.
+            if (QuestGen.Working && QuestGen.quest == __instance) return;
+
+            var mapComp = __originalMethod.Name == nameof(Quest.Initiate)
+                ? MultiplayerAsyncQuest.CacheQuest(__instance)
+                : MultiplayerAsyncQuest.TryGetCachedQuestMap(__instance);
+
+            if (mapComp != null)
+            {
+                __state.mapComp = mapComp;
+                mapComp.PreContext();
+            }
+            else if (Multiplayer.AsyncWorldTime != null)
+            {
+                __state.worldSnapshot = TimeSnapshot.Current();
+                Find.TickManager.ticksGameInt = Multiplayer.AsyncWorldTime.worldTicks;
+            }
         }
 
-        static void Finalizer(AsyncTimeComp __state) => __state?.PostContext();
+        static void Finalizer((AsyncTimeComp mapComp, TimeSnapshot? worldSnapshot) __state)
+        {
+            __state.mapComp?.PostContext();
+            __state.worldSnapshot?.Set();
+        }
     }
 
+    /// <summary>
+    /// Evaluates Quest.TicksSinceAppeared against the quest's assigned time domain (map or world)
+    /// rather than whichever clock happens to be loaded in Find.TickManager.TicksGame during UI rendering.
+    /// </summary>
     [HarmonyPatch(typeof(Quest), nameof(Quest.TicksSinceAppeared), MethodType.Getter)]
     static class QuestTicksSinceAppearedPatch
     {
-        static bool Prefix(Quest __instance, ref int __result)
+        public static bool Prefix(Quest __instance, ref int __result)
         {
             if (Multiplayer.Client == null || !Multiplayer.GameComp.asyncTime) return true;
 
-            var mapComp = MultiplayerAsyncQuest.TryGetCachedQuestMap(__instance);
-            int currentTicks = mapComp != null ? mapComp.mapTicks : Find.TickManager.TicksGame;
+            int currentTicks = MultiplayerAsyncQuest.GetQuestDomainTicks(__instance);
             __result = currentTicks - __instance.appearanceTick;
             return false;
         }
     }
 
+    /// <summary>
+    /// Evaluates Quest.TicksSinceAccepted against the quest's assigned time domain (map or world).
+    /// </summary>
     [HarmonyPatch(typeof(Quest), nameof(Quest.TicksSinceAccepted), MethodType.Getter)]
     static class QuestTicksSinceAcceptedPatch
     {
-        static bool Prefix(Quest __instance, ref int __result)
+        public static bool Prefix(Quest __instance, ref int __result)
         {
             if (Multiplayer.Client == null || !Multiplayer.GameComp.asyncTime) return true;
 
@@ -122,51 +176,122 @@ namespace Multiplayer.Client.Comp
                 return false;
             }
 
-            var mapComp = MultiplayerAsyncQuest.TryGetCachedQuestMap(__instance);
-            int currentTicks = mapComp != null ? mapComp.mapTicks : Find.TickManager.TicksGame;
+            int currentTicks = MultiplayerAsyncQuest.GetQuestDomainTicks(__instance);
             __result = currentTicks - __instance.acceptanceTick;
             return false;
         }
     }
 
+    /// <summary>
+    /// Evaluates Quest.TicksSinceCleanup against the quest's assigned time domain (map or world).
+    /// Preserves vanilla's !cleanedUp check so uncleaned quests always return -1.
+    /// </summary>
     [HarmonyPatch(typeof(Quest), nameof(Quest.TicksSinceCleanup), MethodType.Getter)]
     static class QuestTicksSinceCleanupPatch
     {
-        static bool Prefix(Quest __instance, ref int __result)
+        public static bool Prefix(Quest __instance, ref int __result)
         {
             if (Multiplayer.Client == null || !Multiplayer.GameComp.asyncTime) return true;
 
-            if (__instance.cleanupTick < 0)
+            if (!__instance.cleanedUp || __instance.cleanupTick < 0)
             {
                 __result = -1;
                 return false;
             }
 
-            var mapComp = MultiplayerAsyncQuest.TryGetCachedQuestMap(__instance);
-            int currentTicks = mapComp != null ? mapComp.mapTicks : Find.TickManager.TicksGame;
+            int currentTicks = MultiplayerAsyncQuest.GetQuestDomainTicks(__instance);
             __result = currentTicks - __instance.cleanupTick;
             return false;
         }
     }
 
     /// <summary>
-    /// Ensures that quest initiation executes within the correct map AsyncTimeComp context.
-    /// Setting context during Quest.Initiate guarantees that generated quest parts, threats,
-    /// and timers are initialized against the target map's tick timeline rather than global world time.
+    /// Evaluates Quest.TicksUntilExpiry against the quest's assigned time domain (map or world).
+    /// Without this patch, MainTabWindow_Quests and world ticks evaluate map quests against worldTicks
+    /// (and vice versa), causing quests on maps with lower mapTicks to immediately report 0 ticks remaining
+    /// and transition into QuestState.EndedOfferExpired.
     /// </summary>
-    [HarmonyPatch(typeof(Quest), nameof(Quest.Initiate))]
-    static class SetContextForInitiate
+    [HarmonyPatch(typeof(Quest), nameof(Quest.TicksUntilExpiry), MethodType.Getter)]
+    static class QuestTicksUntilExpiryPatch
     {
-        static void Prefix(Quest __instance, ref AsyncTimeComp __state)
+        public static bool Prefix(Quest __instance, ref int __result)
         {
-            if (Multiplayer.Client == null) return;
-            if (!Multiplayer.GameComp.asyncTime || __instance.parts == null) return;
+            if (Multiplayer.Client == null || !Multiplayer.GameComp.asyncTime) return true;
 
-            __state = MultiplayerAsyncQuest.CacheQuest(__instance);
-            __state?.PreContext();
+            if (__instance.acceptanceExpireTick == -1)
+            {
+                __result = -1;
+                return false;
+            }
+
+            int currentTicks = MultiplayerAsyncQuest.GetQuestDomainTicks(__instance);
+            __result = Math.Max(__instance.acceptanceExpireTick - currentTicks, 0);
+            return false;
         }
+    }
 
-        static void Postfix(AsyncTimeComp __state) => __state?.PostContext();
+    /// <summary>
+    /// Ensures QuestPartActivable.enableTick is recorded against the parent quest's time domain.
+    /// Prevents cross-domain signal propagation (e.g. initiating a world quest from a map command)
+    /// from storing mapTicks inside world quest delay parts, which caused instant timeout expiration.
+    /// </summary>
+    [HarmonyPatch(typeof(QuestPartActivable), "Enable")]
+    static class QuestPartActivableEnablePatch
+    {
+        static void Postfix(QuestPartActivable __instance)
+        {
+            if (Multiplayer.Client == null || !Multiplayer.GameComp.asyncTime || __instance?.quest == null) return;
+
+            int domainTicks = MultiplayerAsyncQuest.GetQuestDomainTicks(__instance.quest);
+            AccessTools.Field(typeof(QuestPartActivable), "enableTick").SetValue(__instance, domainTicks);
+        }
+    }
+
+    /// <summary>
+    /// Evaluates QuestPart_Delay.TicksLeft against the quest's authoritative time domain.
+    /// Fixes shuttle departures, world object timeouts, and raid delays in UI and inspectors.
+    /// </summary>
+    [HarmonyPatch(typeof(QuestPart_Delay), nameof(QuestPart_Delay.TicksLeft), MethodType.Getter)]
+    static class QuestPartDelayTicksLeftPatch
+    {
+        public static bool Prefix(QuestPart_Delay __instance, ref int __result)
+        {
+            if (Multiplayer.Client == null || !Multiplayer.GameComp.asyncTime) return true;
+
+            if (__instance.State != QuestPartState.Enabled)
+            {
+                __result = 0;
+                return false;
+            }
+
+            int currentTicks = MultiplayerAsyncQuest.GetQuestDomainTicks(__instance.quest);
+            __result = Math.Max(__instance.EnableTick + __instance.delayTicks - currentTicks, 0);
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Ensures QuestPart_Delay.QuestPartTick compares elapsed time against the quest's domain ticks
+    /// rather than whichever clock is active in Find.TickManager.TicksGame.
+    /// </summary>
+    [HarmonyPatch(typeof(QuestPart_Delay), nameof(QuestPart_Delay.QuestPartTick))]
+    static class QuestPartDelayTickPatch
+    {
+        public static bool Prefix(QuestPart_Delay __instance)
+        {
+            if (Multiplayer.Client == null || !Multiplayer.GameComp.asyncTime) return true;
+
+            if (__instance.waitUntilPlayerHasHomeMap && Find.AnyPlayerHomeMap == null)
+                return false;
+
+            int currentTicks = MultiplayerAsyncQuest.GetQuestDomainTicks(__instance.quest);
+            if (currentTicks >= __instance.EnableTick + __instance.delayTicks)
+            {
+                __instance.DebugForceEnd();
+            }
+
+            return false;
+        }
     }
 
     [HarmonyPatch(typeof(Quest), nameof(Quest.End))]
@@ -256,6 +381,19 @@ namespace Multiplayer.Client.Comp
         }
 
         /// <summary>
+        /// Returns the current tick count for the quest's time domain (mapTicks if bound to a player home map,
+        /// otherwise worldTicks).
+        /// </summary>
+        public static int GetQuestDomainTicks(Quest quest)
+        {
+            var mapComp = TryGetCachedQuestMap(quest);
+            if (mapComp != null)
+                return mapComp.mapTicks;
+
+            return Multiplayer.AsyncWorldTime?.worldTicks ?? Find.TickManager.TicksGame;
+        }
+
+        /// <summary>
         /// Determines if a quest has a MapAsyncTimeComp, if it does it will cache it to the mapQuestsCache otherwise to worldQuestsCache
         /// </summary>
         /// <param name="quest">Quest to Cache</param>
@@ -318,7 +456,9 @@ namespace Multiplayer.Client.Comp
         }
 
         /// <summary>
-        /// Runs QuestTick() on all ongoing quests using a static reusable buffer to eliminate heap allocations.
+        /// Runs QuestTick() on all quests in the given domain cache using a static reusable buffer.
+        /// Processes Ongoing, NotYetAccepted, and Historical quests to ensure offer expiry cleanup
+        /// and historical quest transitions match vanilla QuestManager.QuestManagerTick behavior.
         /// </summary>
         /// <param name="quests">Collection of quests to tick.</param>
         private static void TickQuests(List<Quest> quests)
@@ -330,7 +470,7 @@ namespace Multiplayer.Client.Comp
             for (int i = 0; i < quests.Count; i++)
             {
                 var quest = quests[i];
-                if (quest != null && quest.State == QuestState.Ongoing)
+                if (quest != null)
                 {
                     TmpQuestsToTick.Add(quest);
                 }
@@ -338,43 +478,102 @@ namespace Multiplayer.Client.Comp
 
             for (int i = 0; i < TmpQuestsToTick.Count; i++)
             {
-                TmpQuestsToTick[i].QuestTick();
+                var quest = TmpQuestsToTick[i];
+                quest.QuestTick();
+
+                if (quest.Historical && Find.QuestManager.activeQuests.Remove(quest))
+                {
+                    if (!Find.QuestManager.historicalQuests.Contains(quest))
+                        Find.QuestManager.historicalQuests.Add(quest);
+                }
             }
 
             TmpQuestsToTick.Clear();
         }
 
         /// <summary>
-        /// Attempts to find the map the quest will target via cached FieldInfo reflection lookups.
+        /// Attempts to find the map the quest targets by checking active QuestGen slate variables,
+        /// top-level and choice-nested QuestParts via cached FieldInfo reflection, and QuestLookTargets.
         /// </summary>
         /// <param name="quest">Quest to check Map Parts on</param>
         /// <returns>MapAsyncTimeComp for that quest or Null if not found</returns>
         private static AsyncTimeComp TryGetQuestMap(Quest quest)
         {
+            // 1. If currently inside QuestGen.Generate for this quest, check the root slate's "map" variable first.
+            // Many quests (Hospitality_Prisoners, Refugee, Beggars) resolve their target map into slate["map"]
+            // while keeping reward/spawn parts inside unselected QuestPart_Choice branches until acceptance.
+            if (QuestGen.Working && QuestGen.quest == quest &&
+                QuestGen.slate.TryGet<Map>("map", out var slateMap) &&
+                slateMap is { IsPlayerHome: true })
+            {
+                var slateMapComp = slateMap.AsyncTime();
+                if (slateMapComp != null)
+                    return slateMapComp;
+            }
+
             var parts = quest.parts;
             if (parts == null) return null;
 
+            // 2. Scan top-level quest parts and nested QuestPart_Choice branches for mapParent fields.
             for (int i = 0; i < parts.Count; i++)
             {
                 var part = parts[i];
                 if (part == null) continue;
 
-                var partType = part.GetType();
-                if (!questPartsToCheck.Contains(partType)) continue;
+                var comp = TryGetMapFromPart(part);
+                if (comp != null)
+                    return comp;
 
-                if (!MapParentFieldCache.TryGetValue(partType, out var field))
+                if (part is QuestPart_Choice choicePart && choicePart.choices != null)
                 {
-                    field = partType.GetField("mapParent", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-                    MapParentFieldCache[partType] = field;
-                }
+                    for (int j = 0; j < choicePart.choices.Count; j++)
+                    {
+                        var choiceParts = choicePart.choices[j]?.questParts;
+                        if (choiceParts == null) continue;
 
-                if (field?.GetValue(part) is MapParent { Map: not null } mapParent)
-                {
-                    var map = mapParent.Map;
-                    var mapAsyncTimeComp = map.IsPlayerHome ? map.AsyncTime() : null;
-                    if (mapAsyncTimeComp != null)
-                        return mapAsyncTimeComp;
+                        for (int k = 0; k < choiceParts.Count; k++)
+                        {
+                            comp = TryGetMapFromPart(choiceParts[k]);
+                            if (comp != null)
+                                return comp;
+                        }
+                    }
                 }
+            }
+
+            // 3. Fallback: inspect any explicit player home map targets in QuestLookTargets.
+            foreach (var target in quest.QuestLookTargets)
+            {
+                Map targetMap = null;
+                if (target.HasWorldObject && target.WorldObject is MapParent { HasMap: true } mp)
+                    targetMap = mp.Map;
+                else if (target.HasThing && target.Thing != null)
+                    targetMap = target.Thing.MapHeld;
+                else if (target.Map != null)
+                    targetMap = target.Map;
+
+                if (targetMap is { IsPlayerHome: true } && targetMap.AsyncTime() is { } targetComp)
+                    return targetComp;
+            }
+
+            return null;
+        }
+
+        private static AsyncTimeComp TryGetMapFromPart(QuestPart part)
+        {
+            if (part == null) return null;
+
+            var partType = part.GetType();
+            if (!MapParentFieldCache.TryGetValue(partType, out var field))
+            {
+                field = partType.GetField("mapParent", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                MapParentFieldCache[partType] = field;
+            }
+
+            if (field != null && field.FieldType == typeof(MapParent) &&
+                field.GetValue(part) is MapParent { Map: { IsPlayerHome: true } map })
+            {
+                return map.AsyncTime();
             }
 
             return null;
