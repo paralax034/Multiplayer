@@ -42,6 +42,44 @@ public static class MainTabWindow_QuestsDoRowPatch
 }
 
 /// <summary>
+/// Registers newly created quests with the initiating player faction in Multifaction mode.
+/// Ensures random natural quests without immediate player look-targets (e.g. bandit camps, item stashes)
+/// remain strictly bound to their originating player faction.
+/// </summary>
+[HarmonyPatch(typeof(QuestManager), nameof(QuestManager.Add))]
+public static class QuestManager_Add_Multifaction_Patch
+{
+    public static void Prefix(Quest quest)
+    {
+        if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction || quest == null)
+            return;
+
+        var worldComp = Multiplayer.WorldComp;
+        if (worldComp == null || worldComp.questFactions.ContainsKey(quest.id))
+            return;
+
+        Faction owningFaction = null;
+        if (quest.TryGetPlayerFaction(out Faction qf))
+        {
+            owningFaction = qf;
+        }
+        else if (Faction.OfPlayer is { IsPlayer: true } curFac && curFac != worldComp.spectatorFaction)
+        {
+            owningFaction = curFac;
+        }
+        else if (Multiplayer.MapContext?.ParentFaction is { IsPlayer: true } mapFac && mapFac != worldComp.spectatorFaction)
+        {
+            owningFaction = mapFac;
+        }
+
+        if (owningFaction != null)
+        {
+            worldComp.questFactions[quest.id] = owningFaction.loadID;
+        }
+    }
+}
+
+/// <summary>
 /// Filters quest entries in the Quests UI tab so players only see quests belonging to their faction when the filter is enabled.
 /// </summary>
 [HarmonyPatch(typeof(MainTabWindow_Quests), nameof(MainTabWindow_Quests.ShouldListNow))]
@@ -722,6 +760,9 @@ static class AnyPawnBlockingMapRemovalPatch
 
     static void Postfix(MapPawns __instance, ref bool __result)
     {
+        if (__result)
+            return;
+
         for (int i = 0; i < __instance.pawnsSpawned.Count; i++)
         {
             var p = __instance.pawnsSpawned[i];
@@ -735,6 +776,16 @@ static class AnyPawnBlockingMapRemovalPatch
                 }
 
                 if (p.health.hediffSet.InLabor())
+                {
+                    __result = true;
+                    break;
+                }
+
+                if (ModsConfig.BiotechActive &&
+                    RecacheColonistBelieverCountPatch.IsColonyMechAnyFaction(p) &&
+                    p.OverseerSubject is { State: OverseerSubjectState.Overseen } &&
+                    !p.Downed &&
+                    p.GetOverseer() != null)
                 {
                     __result = true;
                     break;
@@ -823,6 +874,886 @@ static class TakeToBedGuestFactionPatch
     }
 }
 
+/// <summary>
+/// Allows players in Multifaction mode to abandon a settlement where all colonists have died.
+/// Prevents SettlementAbandonUtility.AllColonistsThere from blocking abandonment when no living colonists exist.
+/// </summary>
+[HarmonyPatch(typeof(SettlementAbandonUtility), nameof(SettlementAbandonUtility.AllColonistsThere))]
+static class SettlementAbandonUtility_AllColonistsThere_Multifaction_Patch
+{
+    static void Postfix(MapParent settlement, ref bool __result)
+    {
+        if (!__result || Multiplayer.Client == null || !Multiplayer.GameComp.multifaction)
+            return;
+
+        if (settlement?.Map is { } map)
+        {
+            var ownerFaction = settlement.Faction ?? Faction.OfPlayer;
+            if (ownerFaction != null && map.mapPawns.FreeHumanlikesSpawnedOfFaction(ownerFaction).Count == 0)
+            {
+                __result = false;
+            }
+        }
+    }
+}
+
+/// <summary>
+/// Triggers automatic player faction cleanup and spectator reassignment if a player abandons their final remaining settlement
+/// and possesses no living colonists, caravans, or maps elsewhere.
+/// </summary>
+[HarmonyPatch(typeof(SettlementAbandonUtility), "Abandon")]
+static class SettlementAbandonUtility_Abandon_Multifaction_Patch
+{
+    static void Prefix(MapParent settlement, out Faction __state)
+    {
+        __state = settlement?.Faction ?? Faction.OfPlayer;
+    }
+
+    static void Postfix(Faction __state)
+    {
+        if (!MultifactionGoodwillIsolation.Active || !MultifactionGoodwillIsolation.IsRealPlayerFaction(__state))
+            return;
+
+        if (!MultifactionFactionRemover.FactionHasAnyPresence(__state))
+        {
+            MultifactionFactionRemover.RemovePlayerFactionNow(__state, destroyRemainingAssets: false);
+        }
+    }
+}
+
+/// <summary>
+/// Manages safe, synchronized removal of player factions in Multifaction mode without modifying Scribe persistence structures.
+/// </summary>
+public static class MultifactionFactionRemover
+{
+    private static readonly Action<FactionManager, Faction> FactionManagerRemoveInternal =
+        AccessTools.MethodDelegate<Action<FactionManager, Faction>>(
+            AccessTools.DeclaredMethod(typeof(FactionManager), "Remove"));
+
+    public static bool FactionHasAnyPresence(Faction faction)
+    {
+        if (faction == null)
+            return false;
+
+        var maps = Find.Maps;
+        if (maps != null)
+        {
+            for (int i = 0; i < maps.Count; i++)
+            {
+                if (maps[i].ParentFaction == faction)
+                    return true;
+            }
+        }
+
+        var settlements = Find.WorldObjects?.Settlements;
+        if (settlements != null)
+        {
+            for (int i = 0; i < settlements.Count; i++)
+            {
+                if (settlements[i].Faction == faction)
+                    return true;
+            }
+        }
+
+        var caravans = Find.WorldObjects?.Caravans;
+        if (caravans != null)
+        {
+            for (int i = 0; i < caravans.Count; i++)
+            {
+                if (caravans[i].Faction == faction)
+                    return true;
+            }
+        }
+
+        var transporters = Find.WorldObjects?.TravellingTransporters;
+        if (transporters != null)
+        {
+            for (int i = 0; i < transporters.Count; i++)
+            {
+                if (transporters[i].Faction == faction)
+                    return true;
+            }
+        }
+
+        if (Find.CurrentGravship != null && Find.CurrentGravship.Faction == faction)
+            return true;
+
+        var alivePawns = PawnsFinder.AllMapsCaravansAndTravellingTransporters_Alive;
+        if (alivePawns != null)
+        {
+            for (int i = 0; i < alivePawns.Count; i++)
+            {
+                var p = alivePawns[i];
+                if (p.Faction == faction && !p.Dead && (p.RaceProps.Humanlike || (ModsConfig.BiotechActive && p.RaceProps.IsMechanoid)))
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    [SyncMethod]
+    public static void SyncedHostRemoveFaction(int factionId)
+    {
+        var faction = Find.FactionManager.GetById(factionId);
+        if (!MultifactionGoodwillIsolation.IsRealPlayerFaction(faction))
+            return;
+
+        RemovePlayerFactionNow(faction, destroyRemainingAssets: true);
+    }
+
+    public static void RemovePlayerFactionNow(Faction faction, bool destroyRemainingAssets)
+    {
+        if (faction == null || Multiplayer.WorldComp == null)
+            return;
+
+        var spectator = Multiplayer.WorldComp.spectatorFaction;
+        if (spectator == null || faction == spectator)
+            return;
+
+        int factionId = faction.loadID;
+        bool moveLocalClientToSpectator =
+            Multiplayer.RealPlayerFaction == faction || Multiplayer.session?.myFactionId == factionId;
+
+        // 1. End all active quests belonging to this faction BEFORE deinitializing maps or despawning pawns.
+        // Prevents quest parts (e.g. QuestPart_RefugeeInteractions) from firing "LeftMap" signals into null maps during DeinitAndRemoveMap.
+        var allQuests = Find.QuestManager?.QuestsListForReading;
+        if (allQuests != null)
+        {
+            bool prevDontSync = Multiplayer.dontSync;
+            Multiplayer.dontSync = true;
+            try
+            {
+                for (int i = allQuests.Count - 1; i >= 0; i--)
+                {
+                    var q = allQuests[i];
+                    if (q != null && !q.Historical && q.TryGetPlayerFaction(out Faction qFac) && qFac == faction)
+                    {
+                        q.End(QuestEndOutcome.Unknown, sendLetter: false, playSound: false);
+                    }
+                }
+            }
+            finally
+            {
+                Multiplayer.dontSync = prevDontSync;
+            }
+        }
+
+        // 2. If host-invoked forced deletion, let vanilla DeinitAndRemoveMap and WorldObject.Destroy clean up maps and caravans
+        if (destroyRemainingAssets)
+        {
+            var removedMaps = new HashSet<Map>();
+            var removedParents = new HashSet<MapParent>();
+
+            ((Map)null).PushFaction(faction, force: true);
+            try
+            {
+                var maps = Find.Maps?.ToList();
+                if (maps != null)
+                {
+                    for (int i = 0; i < maps.Count; i++)
+                    {
+                        var m = maps[i];
+                        if (m.ParentFaction == faction)
+                        {
+                            removedMaps.Add(m);
+                            if (m.Parent != null)
+                                removedParents.Add(m.Parent);
+
+                            if (m.AsyncTime() is { } mapAsyncTime)
+                                global::Multiplayer.Client.Comp.MultiplayerAsyncQuest.TryRemoveCachedMap(mapAsyncTime);
+
+                            // Vanilla MapDeiniter.PassPawnsToWorld handles all pawns on the map cleanly
+                            Current.Game.DeinitAndRemoveMap(m, false);
+                            if (m.Parent is { Destroyed: false })
+                                m.Parent.Destroy();
+                        }
+                    }
+                }
+
+                var worldObjs = Find.WorldObjects?.AllWorldObjects.ToList();
+                if (worldObjs != null)
+                {
+                    for (int i = 0; i < worldObjs.Count; i++)
+                    {
+                        var wo = worldObjs[i];
+                        if (wo.Faction == faction && !wo.Destroyed)
+                        {
+                            if (wo is MapParent mp)
+                                removedParents.Add(mp);
+                            wo.Destroy();
+                        }
+                    }
+                }
+
+                // End any remaining quests whose target mapParent was just destroyed
+                if (allQuests != null && removedParents.Count > 0)
+                {
+                    bool prevDontSync = Multiplayer.dontSync;
+                    Multiplayer.dontSync = true;
+                    try
+                    {
+                        for (int i = allQuests.Count - 1; i >= 0; i--)
+                        {
+                            var q = allQuests[i];
+                            if (q == null || q.Historical || q.parts == null)
+                                continue;
+
+                            for (int p = 0; p < q.parts.Count; p++)
+                            {
+                                if (q.parts[p] is QuestPart_Infestation inf &&
+                                    (inf.mapParent == null || !inf.mapParent.HasMap || removedParents.Contains(inf.mapParent)))
+                                {
+                                    q.End(QuestEndOutcome.Unknown, sendLetter: false, playSound: false);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        Multiplayer.dontSync = prevDontSync;
+                    }
+                }
+
+                // Purge queued storyteller incidents targeting removed maps
+                foreach (var (_, facData) in Multiplayer.WorldComp.factionData)
+                {
+                    facData.storyteller?.incidentQueue?.queuedIncidents?.RemoveAll(qi =>
+                    {
+                        var target = qi?.FiringIncident?.parms?.target;
+                        return (target is Map tm && (removedMaps.Contains(tm) || !Find.Maps.Contains(tm))) ||
+                               (target is MapParent tp && (removedParents.Contains(tp) || tp.Destroyed));
+                    });
+                }
+            }
+            finally
+            {
+                FactionExtensions.PopFaction();
+            }
+        }
+
+        // 3. Purge all letters belonging to this faction from the active letter stack and queue
+        var stack = Find.LetterStack;
+        if (stack != null && Multiplayer.WorldComp?.letterFactions != null)
+        {
+            var letterFactions = Multiplayer.WorldComp.letterFactions;
+            bool prevDontSync = Multiplayer.dontSync;
+            Multiplayer.dontSync = true;
+            try
+            {
+                if (stack.letters != null)
+                {
+                    for (int i = stack.letters.Count - 1; i >= 0; i--)
+                    {
+                        var let = stack.letters[i];
+                        if (let != null && letterFactions.TryGetValue(let.ID, out int ownerId) && ownerId == factionId)
+                            stack.RemoveLetter(let);
+                    }
+                }
+
+                if (stack.letterQueue != null)
+                {
+                    for (int i = stack.letterQueue.Count - 1; i >= 0; i--)
+                    {
+                        var let = stack.letterQueue[i];
+                        if (let != null && letterFactions.TryGetValue(let.ID, out int ownerId) && ownerId == factionId)
+                            stack.letterQueue.RemoveAt(i);
+                    }
+                }
+            }
+            finally
+            {
+                Multiplayer.dontSync = prevDontSync;
+            }
+        }
+
+        // 4. Mark faction as defeated and hidden, and invalidate FactionRepeater cache
+        faction.defeated = true;
+        faction.hidden = true;
+        FactionRepeater.InvalidateCache();
+        MultifactionGameEnder.RemoveFactionState(factionId);
+
+        // 5. Transition local client to Spectator while preserving active simulation FactionContext
+        if (moveLocalClientToSpectator)
+        {
+            var simOfPlayer = Find.FactionManager.ofPlayer;
+            var simWorldFactionId = Multiplayer.WorldComp.GetAppliedFactionId();
+
+            Find.World.renderer.wantedMode = WorldRenderMode.Planet;
+            Multiplayer.game.ChangeRealPlayerFaction(spectator);
+            Multiplayer.session.myFactionId = spectator.loadID;
+            Multiplayer.Client.Send(new global::Multiplayer.Common.Networking.Packet.ClientSetFactionPacket(
+                Multiplayer.session.playerId, spectator.loadID));
+
+            if (!Multiplayer.InInterface && simOfPlayer != null && simOfPlayer != faction)
+            {
+                FactionContext.Set(simOfPlayer);
+                if (simWorldFactionId != -1)
+                    Multiplayer.WorldComp.SetFaction(simWorldFactionId);
+            }
+        }
+
+        if (Find.FactionManager.ofPlayer == faction)
+            Find.FactionManager.ofPlayer = spectator;
+    }
+}
+
+/// <summary>
+/// Ensures MapDeiniter.PassPawnsToWorld executes under the player faction context of the pawns left on the closing map,
+/// routing lost pawn thoughts, adaptation events, and letters to the affected player faction.
+/// </summary>
+[HarmonyPatch(typeof(MapDeiniter), nameof(MapDeiniter.PassPawnsToWorld))]
+static class MapDeiniter_PassPawnsToWorld_FactionContext_Patch
+{
+    static void Prefix(Map map, ref bool __state)
+    {
+        if (!MultifactionGoodwillIsolation.Active || map?.mapPawns == null)
+            return;
+
+        Faction targetFaction = null;
+        if (MultifactionGoodwillIsolation.IsRealPlayerFaction(map.ParentFaction))
+        {
+            targetFaction = map.ParentFaction;
+        }
+        else
+        {
+            var allPawns = map.mapPawns.AllPawns;
+            for (int i = 0; i < allPawns.Count; i++)
+            {
+                var p = allPawns[i];
+                if (MultifactionGoodwillIsolation.IsRealPlayerFaction(p.Faction))
+                {
+                    targetFaction = p.Faction;
+                    break;
+                }
+                if (MultifactionGoodwillIsolation.IsRealPlayerFaction(p.HostFaction))
+                {
+                    targetFaction = p.HostFaction;
+                    break;
+                }
+            }
+        }
+
+        if (targetFaction != null)
+        {
+            ((Map)null).PushFaction(targetFaction, force: true);
+            __state = true;
+        }
+    }
+
+    static void Finalizer(bool __state)
+    {
+        if (__state)
+            FactionExtensions.PopFaction();
+    }
+}
+
+/// <summary>
+/// Routes Storyteller.Notify_PawnEvent to the owning player faction's Storyteller and StoryWatcher,
+/// and isolates DeathRefusal and Adaptation population queries to Faction.OfPlayer.
+/// </summary>
+[HarmonyPatch]
+static class Storyteller_PawnEvent_Multifaction_Patch
+{
+    [HarmonyPatch(typeof(Storyteller), nameof(Storyteller.Notify_PawnEvent))]
+    [HarmonyPrefix]
+    static void NotifyPawnEventPrefix(Storyteller __instance, Pawn pawn, AdaptationEvent ev, DamageInfo? dinfo, ref bool __state)
+    {
+        if (!MultifactionGoodwillIsolation.Active || pawn == null)
+            return;
+
+        var targetFac = pawn.Faction;
+        if (!MultifactionGoodwillIsolation.IsRealPlayerFaction(targetFac))
+            targetFac = pawn.HostFaction;
+
+        if (MultifactionGoodwillIsolation.IsRealPlayerFaction(targetFac) && Faction.OfPlayer != targetFac)
+        {
+            ((Map)null).PushFaction(targetFac, force: true);
+            __state = true;
+        }
+    }
+
+    [HarmonyPatch(typeof(Storyteller), nameof(Storyteller.Notify_PawnEvent))]
+    [HarmonyPostfix]
+    static void NotifyPawnEventPostfix(Storyteller __instance, Pawn pawn, AdaptationEvent ev, DamageInfo? dinfo, bool __state)
+    {
+        if (__state && Find.Storyteller != null && Find.Storyteller != __instance)
+        {
+            var comps = Find.Storyteller.storytellerComps;
+            for (int i = 0; i < comps.Count; i++)
+                comps[i].Notify_PawnEvent(pawn, ev, dinfo);
+        }
+    }
+
+    [HarmonyPatch(typeof(Storyteller), nameof(Storyteller.Notify_PawnEvent))]
+    [HarmonyFinalizer]
+    static void NotifyPawnEventFinalizer(bool __state)
+    {
+        if (__state)
+            FactionExtensions.PopFaction();
+    }
+
+    [HarmonyPatch(typeof(StoryWatcher_Adaptation), nameof(StoryWatcher_Adaptation.Notify_PawnEvent))]
+    [HarmonyPrefix]
+    static bool AdaptationNotifyPawnEventPrefix(Pawn p)
+    {
+        if (!MultifactionGoodwillIsolation.Active || p == null)
+            return true;
+
+        return p.Faction == Faction.OfPlayer;
+    }
+
+    [HarmonyPatch(typeof(StoryWatcher_Adaptation), "get_Population")]
+    [HarmonyPrefix]
+    static bool AdaptationPopulationPrefix(ref int __result)
+    {
+        if (!MultifactionGoodwillIsolation.Active)
+            return true;
+
+        var ofPlayer = Faction.OfPlayer;
+        var pawns = PawnsFinder.AllMapsCaravansAndTravellingTransporters_Alive_OfPlayerFaction;
+        int count = 0;
+        for (int i = 0; i < pawns.Count; i++)
+        {
+            var p = pawns[i];
+            if (p.Faction == ofPlayer && p.RaceProps.Humanlike && p.HostFaction == null && (!p.IsSlave || p.guest.SlaveIsSecure) && !p.IsSubhuman)
+                count++;
+        }
+
+        __result = count;
+        return false;
+    }
+
+    [HarmonyPatch(typeof(DeathRefusalUtility), nameof(DeathRefusalUtility.HasPlayerControlledDeathRefusal))]
+    [HarmonyPostfix]
+    static void HasPlayerControlledDeathRefusalPostfix(Pawn pawn, ref bool __result)
+    {
+        if (!__result || !MultifactionGoodwillIsolation.Active || pawn == null)
+            return;
+
+        if (MultifactionGoodwillIsolation.IsRealPlayerFaction(Faction.OfPlayer) && pawn.Faction != Faction.OfPlayer)
+            __result = false;
+    }
+}
+
+/// <summary>
+/// High-performance, zero-allocation per-faction Game Over manager for Multifaction mode.
+/// </summary>
+public static class MultifactionGameEnder
+{
+    private sealed class FactionEndState
+    {
+        public bool gameEnding;
+        public int ticksToGameOver = -1;
+    }
+
+    private static readonly Dictionary<int, FactionEndState> States = new(8);
+    private const int GameEndCountdownDuration = 400;
+    private const int NewWanderersDelay = 20000;
+
+    public static void Clear() => States.Clear();
+
+    public static void RemoveFactionState(int factionId) => States.Remove(factionId);
+
+    private static FactionEndState GetState(int factionId)
+    {
+        if (!States.TryGetValue(factionId, out var state))
+        {
+            state = new FactionEndState();
+            States[factionId] = state;
+        }
+        return state;
+    }
+
+    /// <summary>
+    /// Fast O(N) evaluation of remaining living colonists for the specified player faction.
+    /// Fast-paths spawned and caravan pawns via cached PawnsFinder collections before inspecting containers.
+    /// </summary>
+    public static bool HasAnyLivingColonists(Faction faction)
+    {
+        if (faction == null)
+            return false;
+
+        if (ShipCountdown.CountingDown)
+            return true;
+
+        if (ModsConfig.OdysseyActive && WorldComponent_GravshipController.CutsceneInProgress)
+            return true;
+
+        if (Find.CurrentGravship != null && Find.CurrentGravship.Faction == faction)
+            return true;
+
+        // 1. Fast-path: scan living spawned pawns and caravans
+        var alivePawns = PawnsFinder.AllMapsCaravansAndTravellingTransporters_Alive_OfPlayerFaction;
+        for (int i = 0; i < alivePawns.Count; i++)
+        {
+            var p = alivePawns[i];
+            if (p.Faction == faction && !p.Dead && p.HostFaction == null && p.RaceProps.Humanlike && (!p.IsSlave || p.guest.SlaveIsSecure) && !p.IsSubhuman)
+                return true;
+        }
+
+        // 2. Carried colonists check
+        var maps = Find.Maps;
+        if (maps != null)
+        {
+            for (int i = 0; i < maps.Count; i++)
+            {
+                var spawned = maps[i].mapPawns.AllPawnsSpawned;
+                for (int j = 0; j < spawned.Count; j++)
+                {
+                    if (spawned[j].carryTracker?.CarriedThing is Pawn carried &&
+                        carried.Faction == faction && !carried.Dead && carried.HostFaction == null && carried.RaceProps.Humanlike && !carried.IsSubhuman)
+                        return true;
+                }
+            }
+        }
+
+        // 3. Self-resurrecting corpses check
+        if (ModsConfig.AnomalyActive && DeathRefusalUtility.PlayerHasCorpseWithDeathRefusal())
+            return true;
+
+        // 4. Quests lending colonists check
+        var activeQuests = Find.QuestManager.ActiveQuestsListForReading;
+        for (int i = 0; i < activeQuests.Count; i++)
+        {
+            var q = activeQuests[i];
+            if (q.State != QuestState.Ongoing) continue;
+
+            var parts = q.PartsListForReading;
+            for (int j = 0; j < parts.Count; j++)
+            {
+                if (parts[j] is QuestPart_LendColonistsToFaction lend)
+                {
+                    var lent = lend.LentColonistsListForReading;
+                    for (int k = 0; k < lent.Count; k++)
+                    {
+                        if (lent[k] is Pawn lp && lp.Faction == faction && !lp.Dead)
+                            return true;
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private static bool HasAnyFactionMap(Faction faction)
+    {
+        var maps = Find.Maps;
+        if (maps != null)
+        {
+            for (int i = 0; i < maps.Count; i++)
+            {
+                if (maps[i].ParentFaction == faction)
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    private static Letter FindFactionGameEndedLetter(int factionId)
+    {
+        var letters = Find.LetterStack.LettersListForReading;
+        var letterFactions = Multiplayer.WorldComp?.letterFactions;
+        if (letterFactions == null)
+            return null;
+
+        for (int i = 0; i < letters.Count; i++)
+        {
+            var let = letters[i];
+            if (let.def == LetterDefOf.GameEnded && letterFactions.TryGetValue(let.ID, out int ownerId) && ownerId == factionId)
+                return let;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Event-driven and throttled state evaluation.
+    /// Never called on per-tick hot paths.
+    /// </summary>
+    public static void CheckOrUpdateGameOverAllFactions()
+    {
+        if (Find.TickManager.TicksGame < 300 || Multiplayer.WorldComp == null)
+            return;
+
+        var spectatorId = Multiplayer.WorldComp.spectatorFaction?.loadID ?? -1;
+        foreach (var (factionId, _) in Multiplayer.WorldComp.factionData)
+        {
+            if (factionId == spectatorId)
+                continue;
+
+            var faction = Find.FactionManager.GetById(factionId);
+            if (faction is not { IsPlayer: true, defeated: false })
+                continue;
+
+            // Isolate FactionContext to evaluate PawnsFinder collections for this faction
+            FactionContext.Push(faction);
+            try
+            {
+                var state = GetState(factionId);
+                if (!HasAnyFactionMap(faction) || HasAnyLivingColonists(faction))
+                {
+                    state.gameEnding = false;
+                }
+                else if (!state.gameEnding)
+                {
+                    state.gameEnding = true;
+                    state.ticksToGameOver = GameEndCountdownDuration;
+                }
+            }
+            finally
+            {
+                FactionContext.Pop();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Per-tick handler. Performs strictly O(1) integer countdowns without map/pawn traversals.
+    /// </summary>
+    public static void GameEndTickAllFactions()
+    {
+        if (Multiplayer.WorldComp == null)
+            return;
+
+        // Periodic safety check once every 250 ticks (~4 seconds) as fallback for unhooked death events
+        if (Find.TickManager.TicksGame % 250 == 0)
+        {
+            CheckOrUpdateGameOverAllFactions();
+        }
+
+        var spectatorId = Multiplayer.WorldComp.spectatorFaction?.loadID ?? -1;
+        foreach (var (factionId, _) in Multiplayer.WorldComp.factionData)
+        {
+            if (factionId == spectatorId)
+                continue;
+
+            var faction = Find.FactionManager.GetById(factionId);
+            if (faction is not { IsPlayer: true, defeated: false })
+                continue;
+
+            var state = GetState(factionId);
+            if (state.gameEnding)
+            {
+                state.ticksToGameOver--;
+                if (state.ticksToGameOver == 0)
+                {
+                    if (FindFactionGameEndedLetter(factionId) == null)
+                    {
+                        var let = LetterMaker.MakeLetter("GameOver".Translate(), "GameOverEveryoneDead".Translate(), LetterDefOf.GameEnded, null, faction);
+                        Find.LetterStack.ReceiveLetter(let, null, 0, true);
+                    }
+                }
+
+                if (Mathf.Abs(state.ticksToGameOver) == NewWanderersDelay && Find.GameEnder.CanSpawnNewWanderers())
+                {
+                    Letter oldLet = FindFactionGameEndedLetter(factionId);
+                    ChoiceLetter newLet = LetterMaker.MakeLetter("GameOverCreateNewWanderers".Translate(), "GameOverCreateNewWanderersText".Translate(), LetterDefOf.GameEnded, null, faction);
+                    Find.LetterStack.ReceiveLetter(newLet, null, 0, true);
+                    if (oldLet != null)
+                    {
+                        bool prevDontSync = Multiplayer.dontSync;
+                        Multiplayer.dontSync = true;
+                        try
+                        {
+                            Find.LetterStack.RemoveLetter(oldLet);
+                        }
+                        finally
+                        {
+                            Multiplayer.dontSync = prevDontSync;
+                        }
+                        newLet.arrivalTick = oldLet.arrivalTick;
+                    }
+                }
+            }
+            else
+            {
+                Letter existing = FindFactionGameEndedLetter(factionId);
+                if (existing != null)
+                {
+                    bool prevDontSync = Multiplayer.dontSync;
+                    Multiplayer.dontSync = true;
+                    try
+                    {
+                        Find.LetterStack.RemoveLetter(existing);
+                    }
+                    finally
+                    {
+                        Multiplayer.dontSync = prevDontSync;
+                    }
+                }
+            }
+        }
+    }
+
+    [SyncMethod]
+    public static void SyncedSpawnNewWanderers(int factionId)
+    {
+        var faction = Find.FactionManager.GetById(factionId);
+        if (faction == null || !faction.IsPlayer)
+            return;
+
+        ((Map)null).PushFaction(faction, force: true);
+        var prevInitData = Current.Game.InitData;
+        try
+        {
+            Map targetMap = Find.AnyPlayerHomeMap;
+            if (targetMap == null)
+                return;
+
+            Current.Game.InitData = new GameInitData
+            {
+                startingPawnCount = 3,
+                playerFaction = faction
+            };
+
+            for (int i = 0; i < 3; i++)
+            {
+                var req = new PawnGenerationRequest(
+                    faction.def.basicMemberKind,
+                    faction,
+                    PawnGenerationContext.PlayerStarter,
+                    forceGenerateNewPawn: true,
+                    mustBeCapableOfViolence: true,
+                    canGeneratePawnRelations: false,
+                    colonistRelationChanceFactor: 0f,
+                    allowGay: true,
+                    allowAddictions: true,
+                    fixedIdeo: faction.ideos?.PrimaryIdeo,
+                    developmentalStages: DevelopmentalStage.Adult);
+
+                Pawn pawn = PawnGenerator.GeneratePawn(req);
+                pawn.relations.everSeenByPlayer = true;
+                PawnComponentsUtility.AddComponentsForSpawn(pawn);
+                StartingPawnUtility.GeneratePossessions(pawn);
+                Current.Game.InitData.startingAndOptionalPawns.Add(pawn);
+            }
+
+            IncidentParms parms = new IncidentParms
+            {
+                target = targetMap,
+                forced = true
+            };
+
+            Find.Storyteller.TryFire(new FiringIncident(IncidentDefOf.GameEndedWanderersJoin, null, parms), false);
+
+            Letter gameEndedLet = FindFactionGameEndedLetter(factionId);
+            if (gameEndedLet != null)
+                Find.LetterStack.RemoveLetter(gameEndedLet);
+
+            var state = GetState(factionId);
+            state.gameEnding = false;
+        }
+        finally
+        {
+            Current.Game.InitData = prevInitData;
+            FactionExtensions.PopFaction();
+        }
+    }
+}
+
+[HarmonyPatch(typeof(GameEnder), nameof(GameEnder.CheckOrUpdateGameOver))]
+static class GameEnder_CheckOrUpdateGameOver_Multifaction_Patch
+{
+    static bool Prefix()
+    {
+        if (!MultifactionGoodwillIsolation.Active)
+            return true;
+
+        MultifactionGameEnder.CheckOrUpdateGameOverAllFactions();
+        return false;
+    }
+}
+
+[HarmonyPatch(typeof(GameEnder), nameof(GameEnder.GameEndTick))]
+static class GameEnder_GameEndTick_Multifaction_Patch
+{
+    static bool Prefix()
+    {
+        if (!MultifactionGoodwillIsolation.Active)
+            return true;
+
+        MultifactionGameEnder.GameEndTickAllFactions();
+        return false;
+    }
+}
+
+[HarmonyPatch(typeof(ChoiceLetter_GameEnded), nameof(ChoiceLetter_GameEnded.Choices), MethodType.Getter)]
+static class ChoiceLetter_GameEnded_Choices_Multifaction_Patch
+{
+    static bool Prefix(ChoiceLetter_GameEnded __instance, ref IEnumerable<DiaOption> __result)
+    {
+        if (Multiplayer.Client == null || !Multiplayer.GameComp.multifaction)
+            return true;
+
+        __result = GetMultifactionChoices(__instance);
+        return false;
+    }
+
+    private static IEnumerable<DiaOption> GetMultifactionChoices(ChoiceLetter_GameEnded letter)
+    {
+        if (letter.ArchivedOnly)
+        {
+            yield return letter.Option_Close;
+            yield break;
+        }
+
+        var myFaction = Multiplayer.RealPlayerFaction ?? Faction.OfPlayer;
+        if (!Find.GameEnder.CanSpawnNewWanderers())
+        {
+            yield return new DiaOption("GameOverKeepWatching".Translate())
+            {
+                resolveTree = true
+            };
+        }
+        else
+        {
+            yield return new DiaOption("GameOverKeepWatchingForNow".Translate())
+            {
+                resolveTree = true
+            };
+
+            float hoursRemaining = (20000 - (GenTicks.TicksGame - letter.arrivalTick)) / 2500f;
+            var createWanderersOpt = new DiaOption("GameOverCreateNewWanderers".Translate())
+            {
+                action = () =>
+                {
+                    if (myFaction != null)
+                        MultifactionGameEnder.SyncedSpawnNewWanderers(myFaction.loadID);
+                },
+                resolveTree = true
+            };
+
+            if (hoursRemaining > 0f)
+            {
+                createWanderersOpt.Disable("GameOverCreateNewWanderersWait".Translate(Math.Ceiling(hoursRemaining)));
+            }
+            else if (Find.AnyPlayerHomeMap == null)
+            {
+                createWanderersOpt.Disable("NoColony".Translate());
+            }
+
+            yield return createWanderersOpt;
+        }
+
+        if (Multiplayer.WorldComp?.spectatorFaction is { } spectator && myFaction != spectator)
+        {
+            yield return new DiaOption("MpCreateOrJoinFaction".TranslateWithBackup("Spectator"))
+            {
+                action = () =>
+                {
+                    Find.World.renderer.wantedMode = WorldRenderMode.Planet;
+                    Multiplayer.game.ChangeRealPlayerFaction(spectator);
+                    Multiplayer.session.myFactionId = spectator.loadID;
+                    Multiplayer.Client.Send(new global::Multiplayer.Common.Networking.Packet.ClientSetFactionPacket(
+                        Multiplayer.session.playerId, spectator.loadID));
+                },
+                resolveTree = true
+            };
+        }
+    }
+}
 
 /// <summary>
 /// Comprehensive security and routing utility for evaluating faction ownership of Things, Pawns, Prisoners, Corpses, and Map-level events in Multifaction mode.
@@ -1546,7 +2477,7 @@ public static class MultifactionGoodwillIsolation
     public static bool Active => Multiplayer.Client != null && Multiplayer.GameComp?.multifaction == true;
 
     public static bool IsRealPlayerFaction(Faction faction) =>
-        faction is { IsPlayer: true } && faction != Multiplayer.WorldComp?.spectatorFaction;
+            faction is { IsPlayer: true, defeated: false } && faction != Multiplayer.WorldComp?.spectatorFaction;
 
     public static Faction ResolveInvolvedPlayerFaction(Faction a, Faction b)
     {

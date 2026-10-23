@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Linq;
+using Multiplayer.Client.Patches;
 using Multiplayer.Client.Util;
 using Multiplayer.Common.Networking.Packet;
 using RimWorld;
@@ -26,7 +27,7 @@ public class FactionsWindow : Window
         Layouter.BeginArea(inRect);
         Layouter.BeginScroll(ref scroll, spacing: 0f);
 
-        var factions = Find.FactionManager.AllFactions.Where(f => f.IsPlayer).ToList();
+        var factions = Find.FactionManager.AllFactions.Where(f => f.IsPlayer && !f.defeated).ToList();
 
         void DrawFactionInLastRect(Faction faction)
         {
@@ -66,6 +67,28 @@ public class FactionsWindow : Window
                 }
 
                 TooltipHandler.TipRegion(colorRect, "MpChangeFactionColor".Translate());
+
+                // Host-only forced deletion button for defunct or opponent factions
+                if (Multiplayer.LocalServer != null && faction != Multiplayer.WorldComp?.spectatorFaction)
+                {
+                    Layouter.BeginVertical(spacing: 0f, false);
+                    Layouter.Rect(0f, 5f);
+
+                    if (Layouter.Button("X", 22f, 20f))
+                    {
+                        var targetFaction = faction;
+                        Find.WindowStack.Add(Dialog_MessageBox.CreateConfirmation(
+                            $"Delete faction '{targetFaction.Name}' and all its settlements and pawns?",
+                            () =>
+                            {
+                                MultifactionFactionRemover.SyncedHostRemoveFaction(targetFaction.loadID);
+                            },
+                            destructive: true));
+                    }
+
+                    TooltipHandler.TipRegion(Layouter.LastRect(), "Delete faction (Host only)");
+                    Layouter.EndVertical();
+                }
             }
             Layouter.EndHorizontal();
 
@@ -91,7 +114,7 @@ public class FactionsWindow : Window
 
             float height = 23 * Multiplayer.session.players.Count(p => p.factionId == factions[i].loadID) + 30f;
             if (i + 1 < factions.Count)
-                height = Math.Max(23 * Multiplayer.session.players.Count(p => p.factionId == factions[i+1].loadID) + 30f, height);
+                height = Math.Max(23 * Multiplayer.session.players.Count(p => p.factionId == factions[i + 1].loadID) + 30f, height);
             height = Math.Max(200, height);
 
             Layouter.FixedHeight(height);

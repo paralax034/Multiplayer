@@ -159,7 +159,8 @@ namespace Multiplayer.Client
             EarlyInit.InitSync();
             CheckInterfaceVersions();
 
-            LongEventHandler.ExecuteWhenFinished(() => {
+            LongEventHandler.ExecuteWhenFinished(() =>
+            {
                 // Double Execute ensures it'll run last.
                 LongEventHandler.ExecuteWhenFinished(EarlyInit.LatePatches);
             });
@@ -183,7 +184,8 @@ namespace Multiplayer.Client
 
             Log.Message($"Current MultiplayerAPI version: {curVersion}");
 
-            foreach (var mod in LoadedModManager.RunningMods) {
+            foreach (var mod in LoadedModManager.RunningMods)
+            {
                 if (mod.assemblies.loadedAssemblies.NullOrEmpty())
                     continue;
 
@@ -191,7 +193,8 @@ namespace Multiplayer.Client
                     continue;
 
                 // Test if mod is using multiplayer api
-                if (!mod.assemblies.loadedAssemblies.Any(a => a.GetName().Name == MpVersion.ApiAssemblyName)) {
+                if (!mod.assemblies.loadedAssemblies.Any(a => a.GetName().Name == MpVersion.ApiAssemblyName))
+                {
                     continue;
                 }
 
@@ -200,7 +203,8 @@ namespace Multiplayer.Client
                     .Select(f => FileVersionInfo.GetVersionInfo(f.FullName))
                     .FirstOrDefault(v => v.ProductName == "Multiplayer");
 
-                if (info == null) {
+                if (info == null)
+                {
                     // There are certain mods that don't include the API, namely compat
                     // Can we test them?
                     continue;
@@ -250,6 +254,7 @@ namespace Multiplayer.Client
 
             TickPatch.Reset();
             VTRSync.Reset();
+            Patches.MultifactionGameEnder.Clear();
 
             Find.WindowStack?.WindowOfType<ServerBrowser>()?.Cleanup(true);
             SyncFieldUtil.ClearAllBufferedChanges();
@@ -266,8 +271,8 @@ namespace Multiplayer.Client
             yield return Assembly.GetAssembly(typeof(Game));
 
             foreach (ModContentPack mod in LoadedModManager.RunningMods)
-            foreach (Assembly assembly in mod.assemblies.loadedAssemblies)
-                yield return assembly;
+                foreach (Assembly assembly in mod.assemblies.loadedAssemblies)
+                    yield return assembly;
 
             if (Assembly.GetEntryAssembly() != null)
                 yield return Assembly.GetEntryAssembly();

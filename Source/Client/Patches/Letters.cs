@@ -22,52 +22,68 @@ namespace Multiplayer.Client.Patches
     {
         public static bool Active => Multiplayer.Client != null && Multiplayer.game?.gameComp?.multifaction == true;
 
+        /// <summary>
+        /// Resolves the intended receiving player faction for a letter.
+        /// When evaluated during simulation (ticks/commands), uses MapContext and active Faction.OfPlayer.
+        /// When evaluated during UI passes (LettersOnGUI), strictly disallows falling back to Faction.OfPlayer
+        /// to prevent UI-thread context leakage.
+        /// </summary>
+        public static Faction ResolveReceivingFaction(Letter let)
+        {
+            if (!Active || let == null)
+                return null;
+
+            // 1. Quests explicit player faction
+            if (let is ChoiceLetter { quest: { } quest } && quest.TryGetPlayerFaction(out Faction qf))
+                return qf;
+
+            // 2. Specific target ownership (colonists, prisoners via HostFaction, corpses, map parent)
+            if (LetterSecurityUtility.ResolveOwnerPlayerFaction(let.lookTargets) is { } targetFac)
+                return targetFac;
+
+            // 3. Explicit related player faction
+            if (let.relatedFaction is { IsPlayer: true } rf && rf != Multiplayer.WorldComp?.spectatorFaction)
+                return rf;
+
+            // 4. Map owner fallback if ticking a player-owned map
+            if (Multiplayer.MapContext?.ParentFaction is { IsPlayer: true } mapFac && mapFac != Multiplayer.WorldComp?.spectatorFaction)
+                return mapFac;
+
+            // 5. Active simulation Faction.OfPlayer context: ONLY valid during authoritative simulation!
+            // Never evaluate Faction.OfPlayer during UI loops where it is locked to the local player's faction.
+            if ((Multiplayer.Ticking || Multiplayer.ExecutingCmds) &&
+                Faction.OfPlayer != null &&
+                Faction.OfPlayer.IsPlayer &&
+                Faction.OfPlayer != Multiplayer.WorldComp?.spectatorFaction)
+            {
+                return Faction.OfPlayer;
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Backward-compatible alias for ResolveReceivingFaction.
+        /// </summary>
+        public static Faction GetReceivingFaction(Letter let) => ResolveReceivingFaction(let);
+
         public static void RecordReceivingFaction(Letter let)
         {
-            // Negative ids are interface-only letters
             if (!Active || let == null || let.ID < 0) return;
 
-            // Delayed letters are received again later from the queue (in another context), keep the first faction
             var letterFactions = Multiplayer.game.worldComp?.letterFactions;
             if (letterFactions == null || letterFactions.ContainsKey(let.ID))
                 return;
 
-            Faction receivingFaction = null;
-
-            // 1. Quests explicit player faction
-            if (let is ChoiceLetter { quest: { } quest } && quest.TryGetPlayerFaction(out Faction qf))
-            {
-                receivingFaction = qf;
-            }
-            // 2. Specific target ownership (colonists, prisoners via HostFaction, corpses, map parent)
-            else if (LetterSecurityUtility.ResolveOwnerPlayerFaction(let.lookTargets) is { } targetFac)
-            {
-                receivingFaction = targetFac;
-            }
-            // 3. Explicit related player faction
-            else if (let.relatedFaction is { IsPlayer: true } rf && rf != Multiplayer.WorldComp?.spectatorFaction)
-            {
-                receivingFaction = rf;
-            }
-            // 4. Map owner fallback if ticking a player-owned map
-            else if (Multiplayer.MapContext?.ParentFaction is { IsPlayer: true } mapFac && mapFac != Multiplayer.WorldComp?.spectatorFaction)
-            {
-                receivingFaction = mapFac;
-            }
-            // 5. Active simulation Faction.OfPlayer context
-            else if (Faction.OfPlayer != null && Faction.OfPlayer != Multiplayer.WorldComp?.spectatorFaction)
-            {
-                receivingFaction = Faction.OfPlayer;
-            }
-
+            Faction receivingFaction = ResolveReceivingFaction(let);
             if (receivingFaction != null)
                 letterFactions[let.ID] = receivingFaction.loadID;
         }
 
         /// <summary>
         /// Evaluates whether a letter in the shared LetterStack should be rendered for the local player's faction.
-        /// Queries the O(1) recorded faction lookup table before falling back to target/quest inspection to prevent
-        /// per-frame QuestLookTargets iterator allocations during LettersOnGUI.
+        /// Uses strict faction bucket isolation: if a letter ID was recorded for a faction, it displays IF AND ONLY IF
+        /// that faction ID matches the local client. Never falls back to ambient UI context.
         /// </summary>
         public static bool IsVisibleLocally(Letter let)
         {
@@ -76,59 +92,121 @@ namespace Multiplayer.Client.Patches
             var myFaction = Multiplayer.RealPlayerFaction;
             if (myFaction == null) return true;
 
-            // Fast-path: check O(1) recorded letter faction first (populated in RecordReceivingFaction via quest/target rules)
+            // 1. Strict O(1) recorded bucket lookup
             var worldComp = Multiplayer.game.worldComp;
             if (worldComp != null && let.ID >= 0 && worldComp.letterFactions.TryGetValue(let.ID, out var factionId))
             {
-                if (factionId == myFaction.loadID)
-                    return true;
-
-                // If recorded under a specific other player faction, strictly hide
-                if (Find.FactionManager.GetById(factionId) is { IsPlayer: true })
-                    return false;
+                return factionId == myFaction.loadID;
             }
 
-            // Fallback for unrecorded or interface-only letters: verify explicit target ownership (prisoners, pawns, maps)
-            if (LetterSecurityUtility.ResolveOwnerPlayerFaction(let.lookTargets) is { } targetOwner)
-                return targetOwner == myFaction;
+            // 2. Interface-only letters (ID < 0) or unrecorded letters
+            Faction receivingFaction = ResolveReceivingFaction(let);
+            if (receivingFaction != null)
+                return receivingFaction == myFaction;
 
-            if (let is ChoiceLetter { quest: { } quest } && quest.TryGetPlayerFaction(out Faction questFac))
-                return questFac == myFaction;
+            if (let.relatedFaction is { IsPlayer: true } rf && rf != myFaction)
+                return false;
 
-            return LetterSecurityUtility.IsLetterForFaction(let, myFaction);
+            if (let.lookTargets?.targets != null && let.lookTargets.targets.Count > 0)
+                return LetterSecurityUtility.IsTargetForFaction(let.lookTargets, myFaction);
+
+            return true;
         }
     }
 
     [HarmonyPatch(typeof(LetterStack), nameof(LetterStack.ReceiveLetter), typeof(Letter), typeof(string), typeof(int), typeof(bool))]
     static class RecordLetterFaction
     {
-        // The letter being received, for the arrival sound
         public static Letter receiving;
+        private static Faction pendingReceivingFaction;
 
-        static void Prefix(Letter let, ref Letter __state)
+        static void Prefix(Letter let, ref bool playSound, ref Letter __state)
         {
             if (Multiplayer.Client == null) return;
 
-            // Record before ReceiveLetter in case arrival sound checks visibility during ReceiveLetter
-            MultifactionLetters.RecordReceivingFaction(let);
             __state = receiving;
             receiving = let;
+
+            // Pre-emptively evaluate receiving faction before letter.ID is generated by vanilla
+            pendingReceivingFaction = MultifactionLetters.ResolveReceivingFaction(let);
+
+            if (playSound && MultifactionLetters.Active && pendingReceivingFaction != null)
+            {
+                var myFaction = Multiplayer.RealPlayerFaction;
+                if (myFaction != null && pendingReceivingFaction != myFaction)
+                {
+                    playSound = false;
+                }
+            }
         }
 
         static void Postfix(Letter let)
         {
             if (Multiplayer.Client == null) return;
 
-            // Vanilla ReceiveLetter assigns let.ID = Find.UniqueIDsManager.GetNextLetterID() inside the method body.
-            // Recording again in Postfix ensures the final assigned let.ID is mapped to the receiving faction
-            // for targetless letters (e.g. Bossgroup incoming alerts).
-            MultifactionLetters.RecordReceivingFaction(let);
+            // Ensure the generated letter ID is permanently tied to the receiving faction resolved in Prefix
+            if (let.ID >= 0 && pendingReceivingFaction != null && Multiplayer.WorldComp?.letterFactions != null)
+            {
+                Multiplayer.WorldComp.letterFactions[let.ID] = pendingReceivingFaction.loadID;
+            }
+            else
+            {
+                MultifactionLetters.RecordReceivingFaction(let);
+            }
+
+            pendingReceivingFaction = null;
         }
 
         static void Finalizer(Letter __state)
         {
             if (Multiplayer.Client == null) return;
             receiving = __state;
+        }
+    }
+
+    /// <summary>
+    /// Forces SignalAction_Letter (such as the "Ancient Danger" notification triggered via RectTrigger)
+    /// to execute under the player faction context of the activating pawn or map, preventing global sound and letter broadcast.
+    /// </summary>
+    [HarmonyPatch(typeof(SignalAction_Letter), "DoAction")]
+    static class SignalAction_Letter_DoAction_Multifaction_Patch
+    {
+        static void Prefix(SignalAction_Letter __instance, SignalArgs args, ref bool __state)
+        {
+            if (!MultifactionLetters.Active)
+                return;
+
+            Faction targetFac = null;
+            if (args.TryGetArg("SUBJECT", out Pawn subject) && subject != null)
+            {
+                if (subject.Faction is { IsPlayer: true })
+                    targetFac = subject.Faction;
+                else if (subject.HostFaction is { IsPlayer: true })
+                    targetFac = subject.HostFaction;
+            }
+
+            if (targetFac == null && __instance.Map != null)
+            {
+                if (__instance.Map.ParentFaction is { IsPlayer: true } mapFac)
+                    targetFac = mapFac;
+            }
+
+            if (targetFac != null && targetFac != Multiplayer.WorldComp?.spectatorFaction)
+            {
+                if (subject != null && (__instance.lookTargets == null || !__instance.lookTargets.IsValid()))
+                {
+                    __instance.lookTargets = subject;
+                }
+
+                FactionContext.Push(targetFac);
+                __state = true;
+            }
+        }
+
+        static void Finalizer(bool __state)
+        {
+            if (__state)
+                FactionContext.Pop();
         }
     }
 

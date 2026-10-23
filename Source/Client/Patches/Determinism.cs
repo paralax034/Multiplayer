@@ -23,13 +23,51 @@ namespace Multiplayer.Client.Patches
     {
         public static bool returnTruePosition = false;
 
-        static bool Prefix() => Multiplayer.Client == null || Multiplayer.InInterface || returnTruePosition;
+        public static bool Prefix() => Multiplayer.Client == null || Multiplayer.InInterface || returnTruePosition;
 
         // Give the root position during ticking
-        static void Postfix(PawnTweener __instance, ref Vector3 __result)
+        public static void Postfix(PawnTweener __instance, ref Vector3 __result)
         {
             if (Multiplayer.Client == null || Multiplayer.InInterface || returnTruePosition) return;
             __result = __instance.TweenedPosRoot();
+        }
+    }
+
+    /// <summary>
+    /// Self-heals stale mapIndexOrState references on Things when a map is removed.
+    /// Third-party mod components (e.g. VEF CachedPawnDataSlowUpdate) periodically poll despawned things via Thing.Spawned;
+    /// if a thing retains an index greater than or equal to Find.Maps.Count after map deinit,
+    /// vanilla logs an error. This patch marks the thing as unspawned (-1) and gracefully returns false.
+    /// </summary>
+    [HarmonyPatch(typeof(Thing), nameof(Thing.Spawned), MethodType.Getter)]
+    static class Thing_Spawned_SelfHeal_Patch
+    {
+        public static bool Prefix(Thing __instance, ref bool __result)
+        {
+            if (__instance.mapIndexOrState >= 0)
+            {
+                var maps = Find.Maps;
+                if (maps == null)
+                {
+                    __result = false;
+                    return false;
+                }
+
+                if ((int)__instance.mapIndexOrState >= maps.Count)
+                {
+                    // Mutate state strictly during authoritative simulation (ticks/commands) or singleplayer.
+                    // Prevents asymmetric state mutation during client-local UI, rendering, or reload passes.
+                    if (Multiplayer.Client == null || Multiplayer.Ticking || Multiplayer.ExecutingCmds)
+                    {
+                        __instance.ForceSetStateToUnspawned();
+                    }
+
+                    __result = false;
+                    return false;
+                }
+            }
+
+            return true;
         }
     }
 
@@ -39,7 +77,7 @@ namespace Multiplayer.Client.Patches
         static MethodBase TargetMethod() =>
             MpMethodUtil.GetLambda(typeof(Pawn_ApparelTracker), nameof(Pawn_ApparelTracker.SortWornApparelIntoDrawOrder));
 
-        static void Postfix(Apparel a, Apparel b, ref int __result)
+        public static void Postfix(Apparel a, Apparel b, ref int __result)
         {
             if (__result == 0)
                 __result = a.thingIDNumber.CompareTo(b.thingIDNumber);
@@ -49,7 +87,7 @@ namespace Multiplayer.Client.Patches
     [HarmonyPatch(typeof(Pawn_MeleeVerbs), nameof(Pawn_MeleeVerbs.TryGetMeleeVerb))]
     static class TryGetMeleeVerbPatch
     {
-        static bool Cancel => Multiplayer.Client != null && Multiplayer.InInterface;
+        public static bool Cancel => Multiplayer.Client != null && Multiplayer.InInterface;
 
         // The melee gizmo of every selected drafted pawn and pawn rendering ask for a melee verb several times per frame
         // (#308), so interface answers are cached for the current frame and tick (ticks run between UI updates of a
@@ -59,13 +97,13 @@ namespace Multiplayer.Client.Patches
         private static readonly Dictionary<(Pawn_MeleeVerbs, Thing), Verb> cache = new();
         private static readonly List<Verb> usableVerbs = new();
 
-        static bool Prefix()
+        public static bool Prefix()
         {
             // The original uses Rand and changes curMeleeVerb (namely called by FloatMenuUtility.GetMeleeAttackAction)
             return !Cancel;
         }
 
-        static void Postfix(Pawn_MeleeVerbs __instance, Thing target, ref Verb __result)
+        public static void Postfix(Pawn_MeleeVerbs __instance, Thing target, ref Verb __result)
         {
             if (!Cancel) return;
 
@@ -228,7 +266,7 @@ namespace Multiplayer.Client.Patches
     [HarmonyPatch(typeof(WorldObjectSelectionUtility), nameof(WorldObjectSelectionUtility.VisibleToCameraNow))]
     static class CaravanVisibleToCameraPatch
     {
-        static void Postfix(ref bool __result)
+        public static void Postfix(ref bool __result)
         {
             if (!Multiplayer.InInterface)
                 __result = false;
@@ -238,13 +276,13 @@ namespace Multiplayer.Client.Patches
     [HarmonyPatch(typeof(WealthWatcher), nameof(WealthWatcher.ForceRecount))]
     static class WealthWatcherRecalc
     {
-        static bool Prefix() => Multiplayer.Client == null || !Multiplayer.InInterface;
+        public static bool Prefix() => Multiplayer.Client == null || !Multiplayer.InInterface;
     }
 
     [HarmonyPatch(typeof(FloodFillerFog), nameof(FloodFillerFog.FloodUnfog))]
     static class FloodUnfogPatch
     {
-        static void Postfix(ref FloodUnfogResult __result)
+        public static void Postfix(ref FloodUnfogResult __result)
         {
             if (Multiplayer.Client != null)
                 __result.allOnScreen = false;
@@ -331,7 +369,7 @@ namespace Multiplayer.Client.Patches
             return MpMethodUtil.GetLambda(typeof(Archive), nameof(Archive.Add));
         }
 
-        static void Postfix(IArchivable x, ref int __result)
+        public static void Postfix(IArchivable x, ref int __result)
         {
             if (x is ArchivedDialog dialog)
                 __result = dialog.ID;
@@ -345,9 +383,9 @@ namespace Multiplayer.Client.Patches
     [HarmonyPatch(typeof(DangerWatcher), nameof(DangerWatcher.DangerRating), MethodType.Getter)]
     static class DangerRatingPatch
     {
-        static bool Prefix() => !Multiplayer.InInterface;
+        public static bool Prefix() => !Multiplayer.InInterface;
 
-        static void Postfix(DangerWatcher __instance, ref StoryDanger __result)
+        public static void Postfix(DangerWatcher __instance, ref StoryDanger __result)
         {
             if (Multiplayer.InInterface)
                 __result = __instance.dangerRatingInt;
@@ -357,27 +395,27 @@ namespace Multiplayer.Client.Patches
     [HarmonyPatch(typeof(Caravan), nameof(Caravan.ImmobilizedByMass), MethodType.Getter)]
     static class ImmobilizedByMass_Patch
     {
-        static bool Prefix() => !Multiplayer.InInterface;
+        public static bool Prefix() => !Multiplayer.InInterface;
     }
 
     [HarmonyPatch(typeof(StoryWatcher_PopAdaptation), nameof(StoryWatcher_PopAdaptation.Notify_PawnEvent))]
     static class CancelStoryWatcherEventInInterface
     {
-        static bool Prefix() => !Multiplayer.InInterface;
+        public static bool Prefix() => !Multiplayer.InInterface;
     }
 
     [HarmonyPatch(typeof(AutoSlaughterManager), nameof(AutoSlaughterManager.Notify_ConfigChanged))]
     static class CancelAutoslaughterDirtying
     {
-        static bool Prefix() => !Multiplayer.InInterface;
+        public static bool Prefix() => !Multiplayer.InInterface;
     }
 
     [HarmonyPatch(typeof(Pawn_AbilityTracker), nameof(Pawn_AbilityTracker.AllAbilitiesForReading), MethodType.Getter)]
     static class DontRecacheAbilitiesInInterface
     {
-        static bool Prefix() => !Multiplayer.InInterface;
+        public static bool Prefix() => !Multiplayer.InInterface;
 
-        static void Postfix(Pawn_AbilityTracker __instance, ref List<Ability> __result)
+        public static void Postfix(Pawn_AbilityTracker __instance, ref List<Ability> __result)
         {
             // The result can be null only if the method gets cancelled by the prefix
             if (__result == null)
@@ -390,7 +428,7 @@ namespace Multiplayer.Client.Patches
     {
         // This can get called in the UI (IsPrioritized timeout check from the gizmos) but has side effects.
         // Calls during ticking (e.g. JobGiver_Work after exhausting the prioritized work) are deterministic.
-        static bool Prefix(PriorityWork __instance)
+        public static bool Prefix(PriorityWork __instance)
         {
             return Multiplayer.Client == null || !Multiplayer.InInterface;
         }
@@ -421,7 +459,7 @@ namespace Multiplayer.Client.Patches
             yield return AccessTools.DeclaredMethod(typeof(CompDissolutionEffect_Pollution), nameof(CompDissolutionEffect_Pollution.WorldUpdate));
         }
 
-        static bool Prefix()
+        public static bool Prefix()
         {
             // In MP only allow updates from MultiplayerWorldComp:Tick()
             return Multiplayer.Client == null || AsyncWorldTimeComp.tickingWorld;
@@ -453,7 +491,7 @@ namespace Multiplayer.Client.Patches
     [HarmonyPatch(typeof(SituationalThoughtHandler), nameof(SituationalThoughtHandler.CheckRecalculateSocialThoughts))]
     static class DontRecalculateSocialThoughtsInInterface
     {
-        static bool Prefix(SituationalThoughtHandler __instance, Pawn otherPawn)
+        public static bool Prefix(SituationalThoughtHandler __instance, Pawn otherPawn)
         {
             if (Multiplayer.Client == null) return true;
             if (Multiplayer.Ticking || Multiplayer.ExecutingCmds) return true;
@@ -500,7 +538,7 @@ namespace Multiplayer.Client.Patches
     [HarmonyPatch(typeof(SituationalThoughtHandler), nameof(SituationalThoughtHandler.UpdateAllMoodThoughts))]
     static class DontRecalculateMoodThoughtsInInterface
     {
-        static bool Prefix(SituationalThoughtHandler __instance)
+        public static bool Prefix(SituationalThoughtHandler __instance)
         {
             if (Multiplayer.Client != null && !Multiplayer.Ticking && !Multiplayer.ExecutingCmds) return false;
 
@@ -737,7 +775,7 @@ namespace Multiplayer.Client.Patches
             __state = true;
         }
 
-        static void Postfix(UndercaveMapComponent __instance, ref bool __state)
+        public static void Postfix(UndercaveMapComponent __instance, ref bool __state)
         {
             // Pop the RNG state from the prefix
             Rand.PopState();
@@ -827,7 +865,7 @@ namespace Multiplayer.Client.Patches
     [HarmonyPatch(typeof(Building_BioferriteHarvester), nameof(Building_BioferriteHarvester.SpawnSetup))]
     static class AlwaysRebuildBioferriteHarvesterCables
     {
-        static void Postfix(Building_BioferriteHarvester __instance)
+        public static void Postfix(Building_BioferriteHarvester __instance)
         {
             // After reloading the game the initialize method will generally be called
             // during rendering, ensure it's called on respawning as well.
@@ -842,7 +880,7 @@ namespace Multiplayer.Client.Patches
     [HarmonyPatch(typeof(Building_Electroharvester), nameof(Building_Electroharvester.SpawnSetup))]
     static class AlwaysRebuildElectroharvesterCables
     {
-        static void Postfix(Building_Electroharvester __instance)
+        public static void Postfix(Building_Electroharvester __instance)
         {
             // After reloading the game the initialize method will generally be called
             // during rendering, ensure it's called on respawning as well.
@@ -857,7 +895,7 @@ namespace Multiplayer.Client.Patches
     [HarmonyPatch(typeof(MainTabWindow), nameof(MainTabWindow.SetInitialSizeAndPosition))]
     static class MainTabWindow_NoResizingInSimulation
     {
-        static bool Prefix()
+        public static bool Prefix()
         {
             return Multiplayer.Client == null || Multiplayer.InInterface;
         }
@@ -991,7 +1029,7 @@ namespace Multiplayer.Client.Patches
     {
         private static readonly List<(QuestScriptDef def, float weight)> CandidateBuffer = new(64);
 
-        static bool Prefix(float points, IIncidentTarget target, ref QuestScriptDef __result)
+        public static bool Prefix(float points, IIncidentTarget target, ref QuestScriptDef __result)
         {
             if (Multiplayer.Client == null) return true;
 
@@ -1184,7 +1222,7 @@ namespace Multiplayer.Client.Patches
             }
         }
 
-        static void Postfix(PlanetTile nearTile, (bool rescan, bool pushedRand) __state)
+        public static void Postfix(PlanetTile nearTile, (bool rescan, bool pushedRand) __state)
         {
             if (!__state.rescan) return;
 
@@ -1207,7 +1245,7 @@ namespace Multiplayer.Client.Patches
     [HarmonyPatch(typeof(GoodwillSituationManager), nameof(GoodwillSituationManager.GetSituations))]
     static class GoodwillSituationsInInterfacePatch
     {
-        static bool Prefix(GoodwillSituationManager __instance, Faction other,
+        public static bool Prefix(GoodwillSituationManager __instance, Faction other,
             ref List<GoodwillSituationManager.CachedSituation> __result)
         {
             if (!Multiplayer.InInterface || other == null || other.IsPlayer || __instance.cachedData.ContainsKey(other))

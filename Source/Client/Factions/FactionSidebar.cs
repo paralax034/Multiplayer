@@ -90,7 +90,8 @@ namespace Multiplayer.Client
             for (int f = 0; f < allFactions.Count; f++)
             {
                 var fac = allFactions[f];
-                if (fac.IsPlayer && fac.name != "Spectator")
+                // Exclude defeated factions and spectator from the faction chooser
+                if (fac.IsPlayer && !fac.defeated && fac.name != "Spectator")
                 {
                     TmpPlayerFactions.Add(fac);
                 }

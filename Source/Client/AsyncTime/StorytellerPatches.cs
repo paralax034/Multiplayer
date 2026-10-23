@@ -116,14 +116,14 @@ public class StorytellerTargetsPatch
         var worldComp = Multiplayer.WorldComp;
         var spectator = worldComp.spectatorFaction;
 
-        if (map != null && OwnerFaction(map) is { IsPlayer: true } owner && owner != spectator &&
+        if (map != null && OwnerFaction(map) is { IsPlayer: true, defeated: false } owner && owner != spectator &&
             worldComp.factionData.ContainsKey(owner.loadID))
             return owner;
 
         Faction first = null;
         foreach (var (id, _) in worldComp.factionData) // Sorted by id
         {
-            if (id == spectator?.loadID || Find.FactionManager.GetById(id) is not { } faction)
+            if (id == spectator?.loadID || Find.FactionManager.GetById(id) is not { defeated: false } faction)
                 continue;
 
             if (map == null || HasPawnsOn(map, faction))

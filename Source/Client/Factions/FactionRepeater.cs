@@ -14,17 +14,29 @@ namespace Multiplayer.Client
     {
         /// <summary>
         /// Immutable snapshot of faction data entries to eliminate red-black tree enumeration overhead on hot paths.
+        /// Tracks both dictionary count and a global invalidation version for defeated/removed factions.
         /// </summary>
         private sealed class CachedEntries<T>
         {
-            public int version;
+            public int count;
+            public int stateVersion;
             public (int id, T data)[] items;
         }
 
         private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<object, object> Cache = new();
+        private static int globalStateVersion;
 
         /// <summary>
-        /// Executes a simulation delegate across all non-spectator player factions.
+        /// Invalidates all cached faction repeater arrays when a faction is marked defeated or removed.
+        /// Guarantees that all clients rebuild their active faction arrays identically on the next simulation tick.
+        /// </summary>
+        public static void InvalidateCache()
+        {
+            globalStateVersion++;
+        }
+
+        /// <summary>
+        /// Executes a simulation delegate across all active, non-spectator, non-defeated player factions.
         /// Uses cached flat array traversal to eliminate 4000+ SortedDictionary.GetEnumerator allocations per frame.
         /// </summary>
         public static bool Template<T>(IDictionary<int, T> factionIdToData, Action<T> dataProcessor, Map map, ref bool ignore)
@@ -33,7 +45,10 @@ namespace Multiplayer.Client
             if (Multiplayer.GameComp == null || !Multiplayer.GameComp.multifaction) return true;
             if (factionIdToData == null || factionIdToData.Count == 0) return true;
 
-            if (!Cache.TryGetValue(factionIdToData, out var raw) || raw is not CachedEntries<T> cached || cached.version != factionIdToData.Count)
+            if (!Cache.TryGetValue(factionIdToData, out var raw) ||
+                raw is not CachedEntries<T> cached ||
+                cached.count != factionIdToData.Count ||
+                cached.stateVersion != globalStateVersion)
             {
                 var spectatorId = Multiplayer.WorldComp?.spectatorFaction?.loadID ?? -1;
                 var list = new List<(int, T)>(factionIdToData.Count);
@@ -41,12 +56,20 @@ namespace Multiplayer.Client
                 foreach (var kv in factionIdToData)
                 {
                     if (kv.Key != spectatorId)
+                    {
+                        var fac = Find.FactionManager.GetById(kv.Key);
+                        // Skip defeated or missing player factions so their storytellers and managers never tick
+                        if (fac == null || fac.defeated)
+                            continue;
+
                         list.Add((kv.Key, kv.Value));
+                    }
                 }
 
                 cached = new CachedEntries<T>
                 {
-                    version = factionIdToData.Count,
+                    count = factionIdToData.Count,
+                    stateVersion = globalStateVersion,
                     items = list.ToArray()
                 };
 
@@ -61,7 +84,12 @@ namespace Multiplayer.Client
             for (int i = 0; i < items.Length; i++)
             {
                 var (id, data) = items[i];
+
+                // Fast-path: active and non-defeated status is guaranteed by globalStateVersion cache invalidation.
+                // Avoid redundant GetById/defeated dictionary lookups on the hot-path.
                 map.PushFaction(id);
+                Multiplayer.WorldComp?.SetFaction(id);
+                map?.MpComp()?.SetFaction(id);
                 try
                 {
                     dataProcessor(data);

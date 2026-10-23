@@ -84,7 +84,7 @@ namespace Multiplayer.Client.AsyncTime
             foreach (var (factionId, _) in worldComp.factionData)
             {
                 var faction = Find.FactionManager.GetById(factionId);
-                if (faction is not { IsPlayer: true } || faction == worldComp.spectatorFaction)
+                if (faction is not { IsPlayer: true, defeated: false } || faction == worldComp.spectatorFaction)
                     continue;
 
                 var prevLastSeason = __instance.lastSeason;
@@ -332,6 +332,32 @@ namespace Multiplayer.Client.AsyncTime
             {
                 manager.Pause();
                 return;
+            }
+
+            // In multifaction mode with asyncTime enabled, pause only the maps of the faction to which the letter belongs.
+            // Avoids pausing the global timeline or opposing players' colonies.
+            if (Multiplayer.GameComp.multifaction &&
+                            Multiplayer.GameComp.asyncTime &&
+                            Multiplayer.MapContext == null &&
+                            Patches.RecordLetterFaction.receiving is { } let)
+            {
+                Faction receivingFac = Patches.MultifactionLetters.ResolveReceivingFaction(let);
+                if (receivingFac != null)
+                {
+                    var maps = Find.Maps;
+                    if (maps != null)
+                    {
+                        for (int i = 0; i < maps.Count; i++)
+                        {
+                            if (maps[i].ParentFaction == receivingFac && maps[i].AsyncTime() is { } asyncComp)
+                            {
+                                asyncComp.DesiredTimeSpeed = TimeSpeed.Paused;
+                                Multiplayer.GameComp.ResetAllTimeVotes(asyncComp.TickableId);
+                            }
+                        }
+                    }
+                    return;
+                }
             }
 
             SimPause();

@@ -156,6 +156,14 @@ public static class FactionExtensions
         if (quest == null)
             return false;
 
+        // O(1) fast path: check the deterministic quest-to-faction registry
+        if (Multiplayer.WorldComp != null && Multiplayer.WorldComp.questFactions.TryGetValue(quest.id, out int fId))
+        {
+            faction = Find.FactionManager.GetById(fId);
+            if (faction != null)
+                return true;
+        }
+
         foreach (var target in quest.QuestLookTargets)
         {
             if (target.HasWorldObject && target.WorldObject != null)
