@@ -1517,3 +1517,524 @@ static class RitualNearbyFactionGoodwill_SkipPlayers_Patch
         return faction.CanChangeGoodwillFor(other, goodwillChange);
     }
 }
+
+/// <summary>
+/// Prevents the dummy spectator faction from participating in goodwill changes or relation notifications.
+/// </summary>
+[HarmonyPatch(typeof(Faction), nameof(Faction.CanChangeGoodwillFor))]
+static class Faction_CanChangeGoodwillFor_Spectator_Patch
+{
+    static void Postfix(Faction __instance, Faction other, ref bool __result)
+    {
+        if (!__result || Multiplayer.Client == null || !Multiplayer.GameComp.multifaction)
+            return;
+
+        var spectator = Multiplayer.WorldComp?.spectatorFaction;
+        if (spectator != null && (__instance == spectator || other == spectator))
+            __result = false;
+    }
+}
+
+/// <summary>
+/// Isolates Faction.OfPlayer context during goodwill and relation mutations so that:
+/// 1. Direct violent/diplomatic actions by a player pawn on any map affect that pawn's player faction rather than the map owner or spectator.
+/// 2. Goodwill messages and hostility letters are routed exclusively to the involved player faction.
+/// 3. Passing ships are only removed from maps belonging to the newly hostile player faction.
+/// </summary>
+public static class MultifactionGoodwillIsolation
+{
+    public static bool Active => Multiplayer.Client != null && Multiplayer.GameComp?.multifaction == true;
+
+    public static bool IsRealPlayerFaction(Faction faction) =>
+        faction is { IsPlayer: true } && faction != Multiplayer.WorldComp?.spectatorFaction;
+
+    public static Faction ResolveInvolvedPlayerFaction(Faction a, Faction b)
+    {
+        if (IsRealPlayerFaction(a) && !IsRealPlayerFaction(b))
+            return a;
+        if (IsRealPlayerFaction(b) && !IsRealPlayerFaction(a))
+            return b;
+        if (IsRealPlayerFaction(a) && IsRealPlayerFaction(b))
+            return a == Faction.OfPlayer || b == Faction.OfPlayer ? Faction.OfPlayer : a;
+        return null;
+    }
+}
+
+[HarmonyPatch(typeof(Faction), nameof(Faction.TryAffectGoodwillWith))]
+static class Faction_TryAffectGoodwillWith_Multifaction_Patch
+{
+    private static readonly MethodInfo MessageMethod = AccessTools.Method(
+        typeof(Messages),
+        nameof(Messages.Message),
+        new[] { typeof(string), typeof(LookTargets), typeof(MessageTypeDef), typeof(bool) });
+
+    private static readonly MethodInfo FilteredMessageMethod = AccessTools.Method(
+        typeof(Faction_TryAffectGoodwillWith_Multifaction_Patch),
+        nameof(SendGoodwillMessage));
+
+    static void Prefix(Faction __instance, Faction other, ref bool __state)
+    {
+        if (!MultifactionGoodwillIsolation.Active)
+            return;
+
+        var playerFac = MultifactionGoodwillIsolation.ResolveInvolvedPlayerFaction(__instance, other);
+        if (playerFac != null)
+        {
+            FactionContext.Push(playerFac);
+            __state = true;
+        }
+    }
+
+    static void Finalizer(bool __state)
+    {
+        if (__state)
+            FactionContext.Pop();
+    }
+
+    static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> insts)
+    {
+        foreach (var ci in insts)
+        {
+            if (ci.Calls(MessageMethod))
+            {
+                yield return new CodeInstruction(OpCodes.Ldarg_0);
+                yield return new CodeInstruction(OpCodes.Ldarg_1);
+                yield return new CodeInstruction(OpCodes.Call, FilteredMessageMethod);
+            }
+            else
+            {
+                yield return ci;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Emits the goodwill change message only if the local client belongs to one of the factions involved.
+    /// Uses non-historical message emission in multifaction to avoid advancing the shared UniqueIDsManager message counter on one client only.
+    /// </summary>
+    private static void SendGoodwillMessage(string text, LookTargets lookTargets, MessageTypeDef def, bool historical, Faction self, Faction other)
+    {
+        if (!MultifactionGoodwillIsolation.Active)
+        {
+            Messages.Message(text, lookTargets, def, historical);
+            return;
+        }
+
+        var myFaction = Multiplayer.RealPlayerFaction;
+        if (myFaction != null && (self == myFaction || other == myFaction))
+        {
+            Messages.Message(text, lookTargets, def, historical: false);
+        }
+    }
+}
+
+[HarmonyPatch(typeof(Faction), nameof(Faction.Notify_RelationKindChanged))]
+static class Faction_NotifyRelationKindChanged_Multifaction_Patch
+{
+    private static readonly MethodInfo RemoveAllShipsMethod = AccessTools.Method(
+        typeof(PassingShipManager),
+        nameof(PassingShipManager.RemoveAllShipsOfFaction));
+
+    private static readonly MethodInfo FilteredRemoveAllShipsMethod = AccessTools.Method(
+        typeof(Faction_NotifyRelationKindChanged_Multifaction_Patch),
+        nameof(RemoveAllShipsOfFactionIfHostile));
+
+    static void Prefix(Faction __instance, Faction other, ref bool __state)
+    {
+        if (!MultifactionGoodwillIsolation.Active)
+            return;
+
+        var playerFac = MultifactionGoodwillIsolation.ResolveInvolvedPlayerFaction(__instance, other);
+        if (playerFac != null)
+        {
+            FactionContext.Push(playerFac);
+            __state = true;
+        }
+    }
+
+    static void Finalizer(bool __state)
+    {
+        if (__state)
+            FactionContext.Pop();
+    }
+
+    static IEnumerable<CodeInstruction> Transpiler(IEnumerable<CodeInstruction> insts)
+    {
+        foreach (var ci in insts)
+        {
+            if (ci.Calls(RemoveAllShipsMethod))
+            {
+                yield return new CodeInstruction(OpCodes.Ldarg_1); // Faction other
+                yield return new CodeInstruction(OpCodes.Call, FilteredRemoveAllShipsMethod);
+            }
+            else
+            {
+                yield return ci;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Prevents a faction becoming hostile to Player A from ejecting orbital traders on Player B's map.
+    /// </summary>
+    private static void RemoveAllShipsOfFactionIfHostile(PassingShipManager manager, Faction faction, Faction other)
+    {
+        if (MultifactionGoodwillIsolation.Active &&
+            manager?.map?.ParentFaction is { IsPlayer: true } mapOwner &&
+            other is { IsPlayer: true } &&
+            mapOwner != other &&
+            !faction.HostileTo(mapOwner))
+        {
+            return;
+        }
+
+        manager.RemoveAllShipsOfFaction(faction);
+    }
+}
+
+/// <summary>
+/// Pushes the instigator's or violator's player faction into FactionContext during Faction notification callbacks
+/// so vanilla checks against Faction.OfPlayer resolve to the actual acting player faction.
+/// </summary>
+[HarmonyPatch]
+static class Faction_ActorContext_Notifications_Patch
+{
+    [HarmonyPatch(typeof(Faction), nameof(Faction.Notify_MemberTookDamage))]
+    [HarmonyPrefix]
+    static void MemberTookDamagePrefix(DamageInfo dinfo, ref bool __state)
+    {
+        if (!MultifactionGoodwillIsolation.Active) return;
+        var fac = dinfo.Instigator?.Faction;
+        if (MultifactionGoodwillIsolation.IsRealPlayerFaction(fac))
+        {
+            FactionContext.Push(fac);
+            __state = true;
+        }
+    }
+
+    [HarmonyPatch(typeof(Faction), nameof(Faction.Notify_MemberTookDamage))]
+    [HarmonyFinalizer]
+    static void MemberTookDamageFinalizer(bool __state)
+    {
+        if (__state) FactionContext.Pop();
+    }
+
+    [HarmonyPatch(typeof(Faction), nameof(Faction.Notify_BuildingTookDamage))]
+    [HarmonyPrefix]
+    static void BuildingTookDamagePrefix(DamageInfo dinfo, ref bool __state)
+    {
+        if (!MultifactionGoodwillIsolation.Active) return;
+        var fac = dinfo.Instigator?.Faction;
+        if (MultifactionGoodwillIsolation.IsRealPlayerFaction(fac))
+        {
+            FactionContext.Push(fac);
+            __state = true;
+        }
+    }
+
+    [HarmonyPatch(typeof(Faction), nameof(Faction.Notify_BuildingTookDamage))]
+    [HarmonyFinalizer]
+    static void BuildingTookDamageFinalizer(bool __state)
+    {
+        if (__state) FactionContext.Pop();
+    }
+
+    [HarmonyPatch(typeof(Faction), nameof(Faction.Notify_BuildingRemoved))]
+    [HarmonyPrefix]
+    static void BuildingRemovedPrefix(Pawn deconstructor, ref bool __state)
+    {
+        if (!MultifactionGoodwillIsolation.Active) return;
+        var fac = deconstructor?.Faction;
+        if (MultifactionGoodwillIsolation.IsRealPlayerFaction(fac))
+        {
+            FactionContext.Push(fac);
+            __state = true;
+        }
+    }
+
+    [HarmonyPatch(typeof(Faction), nameof(Faction.Notify_BuildingRemoved))]
+    [HarmonyFinalizer]
+    static void BuildingRemovedFinalizer(bool __state)
+    {
+        if (__state) FactionContext.Pop();
+    }
+
+    [HarmonyPatch(typeof(Faction), nameof(Faction.Notify_MemberCaptured))]
+    [HarmonyPrefix]
+    static void MemberCapturedPrefix(Faction violator, ref bool __state)
+    {
+        if (!MultifactionGoodwillIsolation.Active) return;
+        if (MultifactionGoodwillIsolation.IsRealPlayerFaction(violator))
+        {
+            FactionContext.Push(violator);
+            __state = true;
+        }
+    }
+
+    [HarmonyPatch(typeof(Faction), nameof(Faction.Notify_MemberCaptured))]
+    [HarmonyFinalizer]
+    static void MemberCapturedFinalizer(bool __state)
+    {
+        if (__state) FactionContext.Pop();
+    }
+
+    [HarmonyPatch(typeof(Faction), nameof(Faction.Notify_MemberStripped))]
+    [HarmonyPrefix]
+    static void MemberStrippedPrefix(Faction violator, ref bool __state)
+    {
+        if (!MultifactionGoodwillIsolation.Active) return;
+        if (MultifactionGoodwillIsolation.IsRealPlayerFaction(violator))
+        {
+            FactionContext.Push(violator);
+            __state = true;
+        }
+    }
+
+    [HarmonyPatch(typeof(Faction), nameof(Faction.Notify_MemberStripped))]
+    [HarmonyFinalizer]
+    static void MemberStrippedFinalizer(bool __state)
+    {
+        if (__state) FactionContext.Pop();
+    }
+
+    [HarmonyPatch(typeof(Faction), nameof(Faction.Notify_PlayerTraded))]
+    [HarmonyPrefix]
+    static void PlayerTradedPrefix(Pawn playerNegotiator, ref bool __state)
+    {
+        if (!MultifactionGoodwillIsolation.Active) return;
+        var fac = playerNegotiator?.Faction;
+        if (MultifactionGoodwillIsolation.IsRealPlayerFaction(fac))
+        {
+            FactionContext.Push(fac);
+            __state = true;
+        }
+    }
+
+    [HarmonyPatch(typeof(Faction), nameof(Faction.Notify_PlayerTraded))]
+    [HarmonyFinalizer]
+    static void PlayerTradedFinalizer(bool __state)
+    {
+        if (__state) FactionContext.Pop();
+    }
+
+    [HarmonyPatch(typeof(Faction), nameof(Faction.Notify_MemberDied))]
+    [HarmonyPrefix]
+    static void MemberDiedPrefix(DamageInfo? dinfo, Map map, ref bool __state)
+    {
+        if (!MultifactionGoodwillIsolation.Active) return;
+        var fac = dinfo?.Instigator?.Faction;
+        if (!MultifactionGoodwillIsolation.IsRealPlayerFaction(fac))
+            fac = map?.ParentFaction;
+
+        if (MultifactionGoodwillIsolation.IsRealPlayerFaction(fac))
+        {
+            FactionContext.Push(fac);
+            __state = true;
+        }
+    }
+
+    [HarmonyPatch(typeof(Faction), nameof(Faction.Notify_MemberDied))]
+    [HarmonyFinalizer]
+    static void MemberDiedFinalizer(bool __state)
+    {
+        if (__state) FactionContext.Pop();
+    }
+
+    [HarmonyPatch(typeof(Faction), nameof(Faction.Notify_MemberExitedMap))]
+    [HarmonyPrefix]
+    static void MemberExitedMapPrefix(Pawn member, ref bool __state)
+    {
+        if (!MultifactionGoodwillIsolation.Active || member == null) return;
+        var fac = member.HostFaction;
+        if (!MultifactionGoodwillIsolation.IsRealPlayerFaction(fac))
+            fac = member.Faction;
+        if (!MultifactionGoodwillIsolation.IsRealPlayerFaction(fac))
+            fac = member.MapHeld?.ParentFaction;
+
+        if (MultifactionGoodwillIsolation.IsRealPlayerFaction(fac))
+        {
+            FactionContext.Push(fac);
+            __state = true;
+        }
+    }
+
+    [HarmonyPatch(typeof(Faction), nameof(Faction.Notify_MemberExitedMap))]
+    [HarmonyFinalizer]
+    static void MemberExitedMapFinalizer(bool __state)
+    {
+        if (__state) FactionContext.Pop();
+    }
+}
+
+/// <summary>
+/// Evaluates SettlementProximityGoodwillUtility per player faction during the world tick,
+/// rather than once under the spectator faction.
+/// </summary>
+[HarmonyPatch(typeof(SettlementProximityGoodwillUtility), nameof(SettlementProximityGoodwillUtility.CheckSettlementProximityGoodwillChange))]
+static class SettlementProximityGoodwill_Multifaction_Patch
+{
+    private static bool ignore;
+
+    static bool Prefix()
+    {
+        if (!MultifactionGoodwillIsolation.Active || ignore)
+            return true;
+
+        if (Find.TickManager.TicksGame == 0 || Find.TickManager.TicksGame % 900000 != 0)
+            return false;
+
+        return FactionRepeater.Template(
+            Multiplayer.WorldComp.factionData,
+            _ => SettlementProximityGoodwillUtility.CheckSettlementProximityGoodwillChange(),
+            null,
+            ref ignore);
+    }
+}
+
+/// <summary>
+/// Restricts colony-wide thoughts (ThoughtToAddToAll: ColonistLost on kidnap, ColonistBanished,
+/// PrisonerBanishedToDie, ColonyPrisonerEscaped, DeniedJoining) strictly to colonists belonging
+/// to the same player faction as the victim/prisoner (or the active Faction.OfPlayer context).
+/// In multifaction simulation, Pawn.IsColonist is true for all player factions; without this guard,
+/// PawnsFinder.AllMapsCaravansAndTravellingTransporters_Alive_Colonists applies the debuff to every player's colony.
+/// </summary>
+[HarmonyPatch(typeof(ThoughtToAddToAll), nameof(ThoughtToAddToAll.Add))]
+static class ThoughtToAddToAll_Multifaction_Patch
+{
+    static bool Prefix(ThoughtToAddToAll __instance, Pawn to)
+    {
+        if (!MultifactionGoodwillIsolation.Active || to == null)
+            return true;
+
+        Faction targetFaction = null;
+        var other = __instance.otherPawn;
+        if (other != null)
+        {
+            if (other.Faction is { IsPlayer: true })
+                targetFaction = other.Faction;
+            else if (other.HostFaction is { IsPlayer: true })
+                targetFaction = other.HostFaction;
+            else if (other.SlaveFaction is { IsPlayer: true })
+                targetFaction = other.SlaveFaction;
+        }
+
+        if (targetFaction == null && MultifactionGoodwillIsolation.IsRealPlayerFaction(Faction.OfPlayer))
+            targetFaction = Faction.OfPlayer;
+
+        if (targetFaction != null && to.Faction != targetFaction)
+            return false;
+
+        return true;
+    }
+}
+
+/// <summary>
+/// Sets the victim's or prisoner's player faction context during PawnDiedOrDownedThoughtsUtility.TryGiveThoughts
+/// and KidnappedPawnsTracker operations so witness thoughts, responsible colonist lookup, bills, and kidnap letters
+/// strictly evaluate against the owning player faction.
+/// </summary>
+[HarmonyPatch]
+static class KidnapAndThoughts_FactionContext_Patch
+{
+    [HarmonyPatch(typeof(PawnDiedOrDownedThoughtsUtility), nameof(PawnDiedOrDownedThoughtsUtility.TryGiveThoughts),
+        new[] { typeof(Pawn), typeof(DamageInfo?), typeof(PawnDiedOrDownedThoughtsKind) })]
+    [HarmonyPrefix]
+    static void TryGiveThoughtsPrefix(Pawn victim, ref bool __state)
+    {
+        if (!MultifactionGoodwillIsolation.Active || victim == null)
+            return;
+
+        Faction fac = null;
+        if (MultifactionGoodwillIsolation.IsRealPlayerFaction(victim.Faction))
+            fac = victim.Faction;
+        else if (MultifactionGoodwillIsolation.IsRealPlayerFaction(victim.HostFaction))
+            fac = victim.HostFaction;
+        else if (MultifactionGoodwillIsolation.IsRealPlayerFaction(victim.MapHeld?.ParentFaction))
+            fac = victim.MapHeld.ParentFaction;
+
+        if (fac != null)
+        {
+            FactionContext.Push(fac);
+            __state = true;
+        }
+    }
+
+    [HarmonyPatch(typeof(PawnDiedOrDownedThoughtsUtility), nameof(PawnDiedOrDownedThoughtsUtility.TryGiveThoughts),
+        new[] { typeof(Pawn), typeof(DamageInfo?), typeof(PawnDiedOrDownedThoughtsKind) })]
+    [HarmonyFinalizer]
+    static void TryGiveThoughtsFinalizer(bool __state)
+    {
+        if (__state)
+            FactionContext.Pop();
+    }
+
+    [HarmonyPatch(typeof(KidnappedPawnsTracker), nameof(KidnappedPawnsTracker.Kidnap))]
+    [HarmonyPrefix]
+    static void KidnapPrefix(Pawn pawn, ref bool __state)
+    {
+        if (!MultifactionGoodwillIsolation.Active || pawn == null)
+            return;
+
+        var fac = pawn.Faction;
+        if (!MultifactionGoodwillIsolation.IsRealPlayerFaction(fac))
+            fac = pawn.HostFaction;
+
+        if (MultifactionGoodwillIsolation.IsRealPlayerFaction(fac))
+        {
+            ((Map)null).PushFaction(fac, force: true);
+            __state = true;
+        }
+    }
+
+    [HarmonyPatch(typeof(KidnappedPawnsTracker), nameof(KidnappedPawnsTracker.Kidnap))]
+    [HarmonyFinalizer]
+    static void KidnapFinalizer(bool __state)
+    {
+        if (__state)
+            FactionExtensions.PopFaction();
+    }
+
+    [HarmonyPatch(typeof(KidnappedPawnsTracker), nameof(KidnappedPawnsTracker.RemoveKidnappedPawn))]
+    [HarmonyPrefix]
+    static void RemoveKidnappedPawnPrefix(Pawn pawn, ref bool __state)
+    {
+        if (!MultifactionGoodwillIsolation.Active || pawn == null)
+            return;
+
+        if (MultifactionGoodwillIsolation.IsRealPlayerFaction(pawn.Faction))
+        {
+            FactionContext.Push(pawn.Faction);
+            __state = true;
+        }
+    }
+
+    [HarmonyPatch(typeof(KidnappedPawnsTracker), nameof(KidnappedPawnsTracker.RemoveKidnappedPawn))]
+    [HarmonyFinalizer]
+    static void RemoveKidnappedPawnFinalizer(bool __state)
+    {
+        if (__state)
+            FactionContext.Pop();
+    }
+
+    [HarmonyPatch(typeof(ThoughtWorker_ColonistLeftUnburied), "CurrentStateInternal")]
+    [HarmonyPrefix]
+    static void ColonistLeftUnburiedPrefix(Pawn p, ref bool __state)
+    {
+        if (!MultifactionGoodwillIsolation.Active || p == null)
+            return;
+
+        if (MultifactionGoodwillIsolation.IsRealPlayerFaction(p.Faction))
+        {
+            FactionContext.Push(p.Faction);
+            __state = true;
+        }
+    }
+
+    [HarmonyPatch(typeof(ThoughtWorker_ColonistLeftUnburied), "CurrentStateInternal")]
+    [HarmonyFinalizer]
+    static void ColonistLeftUnburiedFinalizer(bool __state)
+    {
+        if (__state)
+            FactionContext.Pop();
+    }
+}
