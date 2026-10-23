@@ -975,6 +975,171 @@ namespace Multiplayer.Client.Patches
         }
     }
 
+    /// <summary>
+    /// Replaces vanilla's eager O(N) QuestScriptDef.CanRun evaluation across all root quests in
+    /// NaturalRandomQuestChooser.ChooseNaturalRandomQuest with lazy weighted sampling without replacement.
+    /// In vanilla, ChooseNaturalRandomQuest runs QuestScriptDef.CanRun (which executes a full QuestNode.TestRun,
+    /// single-threaded FastTileFinder queries, and hundreds of thousands of RNG calls) on every QuestScriptDef
+    /// in the game—even those with a selection weight of 0—before picking a single quest by weight, causing a
+    /// 3.5–5 second freeze whenever the Storyteller or DevTools generates a natural random quest.
+    /// By computing inexpensive selection weights first and evaluating CanRun only on the sampled candidate
+    /// (removing rejected candidates and resampling if CanRun returns false), the exact mathematical probability
+    /// distribution and multiplayer RNG determinism are preserved while reducing TestRun executions from ~80 to ~1.
+    /// </summary>
+    [HarmonyPatch(typeof(NaturalRandomQuestChooser), nameof(NaturalRandomQuestChooser.ChooseNaturalRandomQuest))]
+    static class LazyNaturalRandomQuestChooserPatch
+    {
+        private static readonly List<(QuestScriptDef def, float weight)> CandidateBuffer = new(64);
+
+        static bool Prefix(float points, IIncidentTarget target, ref QuestScriptDef __result)
+        {
+            if (Multiplayer.Client == null) return true;
+
+            bool incPop = Rand.Chance(NaturalRandomQuestChooser.PopulationIncreasingQuestChance());
+            if (TryGetQuestLazy(incPop, points, target, out var chosen))
+            {
+                __result = chosen;
+                return false;
+            }
+
+            if (incPop && TryGetQuestLazy(false, points, target, out var fallbackChosen))
+            {
+                __result = fallbackChosen;
+                return false;
+            }
+
+            __result = null;
+            return false;
+        }
+
+        /// <summary>
+        /// Samples quests proportional to GetNaturalRandomSelectionWeight and evaluates CanRun lazily.
+        /// Uses a pre-allocated static buffer to guarantee zero heap allocations on the simulation path.
+        /// </summary>
+        private static bool TryGetQuestLazy(bool incPop, float points, IIncidentTarget target, out QuestScriptDef chosen)
+        {
+            CandidateBuffer.Clear();
+            var allDefs = DefDatabase<QuestScriptDef>.AllDefsListForReading;
+            var storyState = target.StoryState;
+            float totalWeight = 0f;
+
+            for (int i = 0; i < allDefs.Count; i++)
+            {
+                var def = allDefs[i];
+                if (!def.IsRootRandomSelected || def.rootIncreasesPopulation != incPop)
+                    continue;
+
+                float weight = NaturalRandomQuestChooser.GetNaturalRandomSelectionWeight(def, points, storyState);
+                if (weight > 0f)
+                {
+                    CandidateBuffer.Add((def, weight));
+                    totalWeight += weight;
+                }
+            }
+
+            try
+            {
+                while (CandidateBuffer.Count > 0 && totalWeight > 0f)
+                {
+                    float roll = Rand.Value * totalWeight;
+                    int pickedIndex = CandidateBuffer.Count - 1;
+                    float cumulative = 0f;
+
+                    for (int i = 0; i < CandidateBuffer.Count; i++)
+                    {
+                        cumulative += CandidateBuffer[i].weight;
+                        if (roll <= cumulative)
+                        {
+                            pickedIndex = i;
+                            break;
+                        }
+                    }
+
+                    var candidate = CandidateBuffer[pickedIndex];
+                    if (candidate.def.CanRun(points, target))
+                    {
+                        chosen = candidate.def;
+                        return true;
+                    }
+
+                    // Candidate failed CanRun; remove it and resample from the remaining weighted pool
+                    totalWeight -= candidate.weight;
+                    CandidateBuffer.RemoveAt(pickedIndex);
+                }
+
+                chosen = null;
+                return false;
+            }
+            finally
+            {
+                CandidateBuffer.Clear();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Isolates QuestScriptDef.CanRun cache state between client-local interface evaluations (e.g. DevTools quest menu)
+    /// and authoritative simulation ticks/commands, and scopes the per-tick cache by simulation step, target, and faction.
+    /// In vanilla, QuestScriptDef caches lastCanRunResult solely by (Find.TickManager.TicksGame, points).
+    /// Without this patch, opening the DevTools quest menu in the interface sets lastCheckCanRunTick = TicksGame
+    /// on that client only, causing the subsequent simulation command to skip root.TestRun() (and its RNG calls)
+    /// on the issuer while other clients execute TestRun() and advance Rand.
+    /// </summary>
+    [HarmonyPatch(typeof(QuestScriptDef), nameof(QuestScriptDef.CanRun), typeof(Slate), typeof(IIncidentTarget))]
+    static class QuestScriptDefCanRunDeterminismPatch
+    {
+        private static int lastSimStep = -1;
+        private static IIncidentTarget lastSimTarget;
+        private static Faction lastSimFaction;
+
+        static void Prefix(
+            QuestScriptDef __instance,
+            IIncidentTarget target,
+            ref (bool inInterface, int tick, int points, bool result) __state)
+        {
+            if (Multiplayer.Client == null) return;
+
+            if (Multiplayer.InInterface)
+            {
+                // Preserve simulation cache fields and isolate RNG so interface inspections never pollute simulation state
+                __state = (true, __instance.lastCheckCanRunTick, __instance.lastCheckCanRunPoints, __instance.lastCanRunResult);
+                Rand.PushState();
+                return;
+            }
+
+            // In simulation (including multifaction storyteller passes where multiple factions tick at the same TicksGame),
+            // invalidate all QuestScriptDef tick caches once when the simulation step, target, or player faction changes.
+            var curFaction = Faction.OfPlayerSilentFail;
+            if (lastSimStep != TickPatch.simStep ||
+                lastSimTarget != target ||
+                lastSimFaction != curFaction)
+            {
+                var allDefs = DefDatabase<QuestScriptDef>.AllDefsListForReading;
+                for (int i = 0; i < allDefs.Count; i++)
+                    allDefs[i].lastCheckCanRunTick = -1;
+
+                lastSimStep = TickPatch.simStep;
+                lastSimTarget = target;
+                lastSimFaction = curFaction;
+            }
+        }
+
+        static void Finalizer(
+            QuestScriptDef __instance,
+            (bool inInterface, int tick, int points, bool result) __state)
+        {
+            if (Multiplayer.Client == null) return;
+
+            if (__state.inInterface)
+            {
+                Rand.PopState();
+                __instance.lastCheckCanRunTick = __state.tick;
+                __instance.lastCheckCanRunPoints = __state.points;
+                __instance.lastCanRunResult = __state.result;
+            }
+        }
+    }
+
     // PlayerItemAccessibilityUtility caches its scan of all accessible things per (tile, RealTime.frameCount). Quest
     // generation (trade request and beggars quests, also during every random quest selection) calls it from the
     // simulation, and the scan uses Rand (leather amounts): whether a call rescans depended on the client's frames,
@@ -987,15 +1152,17 @@ namespace Multiplayer.Client.Patches
         private static PlanetTile scanTile = PlanetTile.Invalid;
         private static int scanStep = -1;
 
-        static void Prefix(PlanetTile nearTile, ref bool __state)
+        static void Prefix(PlanetTile nearTile, ref (bool rescan, bool pushedRand) __state)
         {
             if (Multiplayer.Client == null) return;
 
             // Also sim long events, loading etc.: every simulation step (TickPatch.simStep) starts with a new key
             if (Multiplayer.InInterface)
             {
-                // May rescan and replace the contents
+                // May rescan and replace the contents; isolate RNG so interface scans never advance shared Rand
                 scanGame = null;
+                Rand.PushState(Gen.HashCombineInt(nearTile.tileId, Find.TickManager?.TicksGame ?? 0));
+                __state.pushedRand = true;
                 return;
             }
 
@@ -1007,20 +1174,29 @@ namespace Multiplayer.Client.Patches
             }
             else
             {
-                // Make vanilla rescan, a frame count is never -1
+                // Make vanilla rescan, a frame count is never -1.
+                // Seed RNG deterministically by (tileId, TicksGame) so GenMath.RoundRandom(LeatherAmount)
+                // never perturbs the outer simulation RNG stream when a rescan occurs.
                 PlayerItemAccessibilityUtility.cachedAccessibleThingsForFrame = -1;
                 scanGame = null;
-                __state = true;
+                Rand.PushState(Gen.HashCombineInt(nearTile.tileId, Find.TickManager?.TicksGame ?? 0));
+                __state = (true, true);
             }
         }
 
-        static void Postfix(PlanetTile nearTile, bool __state)
+        static void Postfix(PlanetTile nearTile, (bool rescan, bool pushedRand) __state)
         {
-            if (!__state) return;
+            if (!__state.rescan) return;
 
             scanGame = Current.Game;
             scanTile = nearTile;
             scanStep = TickPatch.simStep;
+        }
+
+        static void Finalizer((bool rescan, bool pushedRand) __state)
+        {
+            if (__state.pushedRand)
+                Rand.PopState();
         }
     }
 

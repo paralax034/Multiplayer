@@ -64,6 +64,11 @@ namespace Multiplayer.Client.Patches
                 letterFactions[let.ID] = receivingFaction.loadID;
         }
 
+        /// <summary>
+        /// Evaluates whether a letter in the shared LetterStack should be rendered for the local player's faction.
+        /// Queries the O(1) recorded faction lookup table before falling back to target/quest inspection to prevent
+        /// per-frame QuestLookTargets iterator allocations during LettersOnGUI.
+        /// </summary>
         public static bool IsVisibleLocally(Letter let)
         {
             if (!Active || let == null) return true;
@@ -71,15 +76,9 @@ namespace Multiplayer.Client.Patches
             var myFaction = Multiplayer.RealPlayerFaction;
             if (myFaction == null) return true;
 
-            // Always verify explicit target ownership first (prisoners, pawns, maps)
-            if (LetterSecurityUtility.ResolveOwnerPlayerFaction(let.lookTargets) is { } targetOwner)
-                return targetOwner == myFaction;
-
-            if (let is ChoiceLetter { quest: { } quest } && quest.TryGetPlayerFaction(out Faction questFac))
-                return questFac == myFaction;
-
+            // Fast-path: check O(1) recorded letter faction first (populated in RecordReceivingFaction via quest/target rules)
             var worldComp = Multiplayer.game.worldComp;
-            if (worldComp != null && worldComp.letterFactions.TryGetValue(let.ID, out var factionId))
+            if (worldComp != null && let.ID >= 0 && worldComp.letterFactions.TryGetValue(let.ID, out var factionId))
             {
                 if (factionId == myFaction.loadID)
                     return true;
@@ -88,6 +87,13 @@ namespace Multiplayer.Client.Patches
                 if (Find.FactionManager.GetById(factionId) is { IsPlayer: true })
                     return false;
             }
+
+            // Fallback for unrecorded or interface-only letters: verify explicit target ownership (prisoners, pawns, maps)
+            if (LetterSecurityUtility.ResolveOwnerPlayerFaction(let.lookTargets) is { } targetOwner)
+                return targetOwner == myFaction;
+
+            if (let is ChoiceLetter { quest: { } quest } && quest.TryGetPlayerFaction(out Faction questFac))
+                return questFac == myFaction;
 
             return LetterSecurityUtility.IsLetterForFaction(let, myFaction);
         }
