@@ -62,6 +62,7 @@ namespace Multiplayer.Common
             InitDataState.Requested;
 
         public volatile bool running;
+        public Thread? serverThread;
 
         public bool ArbiterPlaying => PlayingPlayers.Any(p => p.IsArbiter && p.status == PlayerStatus.Playing);
         public ServerPlayer HostPlayer => PlayingPlayers.First(p => p.IsHost);
@@ -78,7 +79,6 @@ namespace Multiplayer.Common
         public bool IsStandaloneServer { get; set; }
         public StandalonePersistence? persistence;
 
-        private Thread? serverThread;
         private int offThreadCalls;
         public int OffThreadCalls => offThreadCalls;
 
@@ -213,23 +213,37 @@ namespace Multiplayer.Common
                 serverTimePerTick = StandardTimePerTick * 4f;
         }
 
-        public static readonly TimeSpan StopTimeout = TimeSpan.FromSeconds(5);
-        private int stopped;
+public static readonly TimeSpan StopTimeout = TimeSpan.FromSeconds(5);
+private int stopped;
 
-        /// Stops the server once, later calls do nothing. Server state isn't thread safe, so called from another
-        /// thread, this waits for the server thread to finish its iteration and stop the server on its way out
-        /// (Run). Only if that takes too long is the server stopped from the calling thread.
-        public void TryStop()
-        {
-            running = false;
-            Thread.MemoryBarrier();
+/// <summary>
+/// Starts the server loop on a dedicated named thread, guarding against double-start on the same instance.
+/// </summary>
+public Thread StartServer(string threadName = "Server thread")
+{
+    if (serverThread != null)
+        throw new InvalidOperationException("Server loop thread is already running; stop the server before starting it again.");
 
-            var thread = serverThread;
-            if (thread != null && thread != Thread.CurrentThread && !thread.Join(StopTimeout))
-                ServerLog.Error($"The server thread didn't stop within {StopTimeout.TotalSeconds}s, " +
-                                $"stopping the server from thread {Thread.CurrentThread.ManagedThreadId}");
+    serverThread = new Thread(Run) { Name = threadName };
+    serverThread.Start();
+    return serverThread;
+}
 
-            if (Interlocked.Exchange(ref stopped, 1) != 0) return;
+/// <summary>
+/// Stops the server once; subsequent calls do nothing. When called from another thread, waits up to
+/// <see cref="StopTimeout"/> for the server thread to finish its current iteration before tearing down.
+/// </summary>
+public void TryStop()
+{
+    running = false;
+    Thread.MemoryBarrier();
+
+    var thread = serverThread;
+    if (thread != null && thread != Thread.CurrentThread && !thread.Join(StopTimeout))
+        ServerLog.Error($"The server thread didn't stop within {StopTimeout.TotalSeconds}s, " +
+                        $"stopping the server from thread {Thread.CurrentThread.ManagedThreadId}");
+
+    if (Interlocked.Exchange(ref stopped, 1) != 0) return;
 
             ServerLog.Detail("Server shutting down...");
 

@@ -205,6 +205,8 @@ public class ServerTest
         beforeStart?.Invoke(server);
 
         var serverThread = new Thread(server.Run) { IsBackground = true };
+        // Register the loop thread so TryStop's join contract is exercised here too.
+        server.serverThread = serverThread;
         serverThread.Start();
 
         teardownActions.Add(server.TryStop);
